@@ -1,4 +1,4 @@
-// SiYuan - Build Your Eternal Digital Garden
+// SiYuan - Refactor your thinking
 // Copyright (c) 2020-present, b3log.org
 //
 // This program is free software: you can redistribute it and/or modify
@@ -30,6 +30,10 @@ func NeedCaptcha() bool {
 
 // SessionData represents the session.
 type SessionData struct {
+	Workspaces map[string]*WorkspaceSession // <WorkspacePath, WorkspaceSession>
+}
+
+type WorkspaceSession struct {
 	AccessAuthCode string
 	Captcha        string
 }
@@ -38,7 +42,7 @@ type SessionData struct {
 func (sd *SessionData) Save(c *gin.Context) error {
 	session := ginSessions.Default(c)
 	sessionDataBytes, err := gulu.JSON.MarshalJSON(sd)
-	if nil != err {
+	if err != nil {
 		return err
 	}
 	session.Set("data", string(sessionDataBytes))
@@ -56,10 +60,27 @@ func GetSession(c *gin.Context) *SessionData {
 	}
 
 	err := gulu.JSON.UnmarshalJSON([]byte(sessionDataStr.(string)), ret)
-	if nil != err {
+	if err != nil {
 		return ret
 	}
 
 	c.Set("session", ret)
 	return ret
+}
+
+func GetWorkspaceSession(session *SessionData) (ret *WorkspaceSession) {
+	ret = &WorkspaceSession{}
+	if nil == session.Workspaces {
+		session.Workspaces = map[string]*WorkspaceSession{}
+	}
+	ret = session.Workspaces[WorkspaceDir]
+	if nil == ret {
+		ret = &WorkspaceSession{}
+		session.Workspaces[WorkspaceDir] = ret
+	}
+	return
+}
+
+func RemoveWorkspaceSession(session *SessionData) {
+	delete(session.Workspaces, WorkspaceDir)
 }

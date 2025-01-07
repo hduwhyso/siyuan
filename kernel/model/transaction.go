@@ -1,4 +1,4 @@
-// SiYuan - Build Your Eternal Digital Garden
+// SiYuan - Refactor your thinking
 // Copyright (c) 2020-present, b3log.org
 //
 // This program is free software: you can redistribute it and/or modify
@@ -21,28 +21,34 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"runtime/debug"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/88250/gulu"
+	"github.com/88250/lute"
 	"github.com/88250/lute/ast"
 	"github.com/88250/lute/editor"
 	"github.com/88250/lute/lex"
 	"github.com/88250/lute/parse"
-	"github.com/emirpasic/gods/sets/hashset"
 	"github.com/siyuan-note/filelock"
 	"github.com/siyuan-note/logging"
+	"github.com/siyuan-note/siyuan/kernel/av"
 	"github.com/siyuan-note/siyuan/kernel/cache"
+	"github.com/siyuan-note/siyuan/kernel/filesys"
 	"github.com/siyuan-note/siyuan/kernel/sql"
+	"github.com/siyuan-note/siyuan/kernel/task"
 	"github.com/siyuan-note/siyuan/kernel/treenode"
 	"github.com/siyuan-note/siyuan/kernel/util"
 )
 
-func IsFoldHeading(transactions *[]*Transaction) bool {
+func IsMoveOutlineHeading(transactions *[]*Transaction) bool {
 	for _, tx := range *transactions {
 		for _, op := range tx.DoOperations {
-			if "foldHeading" == op.Action {
+			if "moveOutlineHeading" == op.Action {
 				return true
 			}
 		}
@@ -50,129 +56,75 @@ func IsFoldHeading(transactions *[]*Transaction) bool {
 	return false
 }
 
-func IsUnfoldHeading(transactions *[]*Transaction) bool {
-	for _, tx := range *transactions {
-		for _, op := range tx.DoOperations {
-			if "unfoldHeading" == op.Action {
-				return true
-			}
-		}
+func FlushTxQueue() {
+	time.Sleep(time.Duration(50) * time.Millisecond)
+	for 0 < len(txQueue) || isFlushing {
+		time.Sleep(10 * time.Millisecond)
 	}
-	return false
 }
-
-const txFixDelay = 10
 
 var (
-	txQueue     []*Transaction
-	txQueueLock = sync.Mutex{}
-	txDelay     = txFixDelay
-
-	currentTx *Transaction
+	txQueue    = make(chan *Transaction, 7)
+	flushLock  = sync.Mutex{}
+	isFlushing = false
 )
 
-func WaitForWritingFiles() {
-	var printLog bool
-	var lastPrintLog bool
-	for i := 0; isWritingFiles(); i++ {
-		time.Sleep(5 * time.Millisecond)
-		if 2000 < i && !printLog { // 10s 后打日志
-			logging.LogWarnf("file is writing: \n%s", logging.ShortStack())
-			printLog = true
-		}
-		if 12000 < i && !lastPrintLog { // 60s 后打日志
-			logging.LogWarnf("file is still writing")
-			lastPrintLog = true
-		}
-	}
+func init() {
+	go flushQueue()
 }
 
-func isWritingFiles() bool {
-	time.Sleep(time.Duration(txDelay+5) * time.Millisecond)
-	if 0 < len(txQueue) || util.IsMutexLocked(&txQueueLock) {
-		return true
-	}
-	return nil != currentTx
-}
-
-func AutoFlushTx() {
-	go autoFlushUpdateRefTextRenameDoc()
+func flushQueue() {
 	for {
-		flushTx()
-		time.Sleep(time.Duration(txDelay) * time.Millisecond)
+		select {
+		case tx := <-txQueue:
+			flushTx(tx)
+		}
 	}
 }
 
-var txLock = sync.Mutex{}
-
-func flushTx() {
-	txLock.Lock()
-	defer txLock.Unlock()
-
+func flushTx(tx *Transaction) {
 	defer logging.Recover()
+	flushLock.Lock()
+	isFlushing = true
+	defer func() {
+		isFlushing = false
+		flushLock.Unlock()
+	}()
 
-	currentTx = mergeTx()
 	start := time.Now()
-	if txErr := performTx(currentTx); nil != txErr {
+	if txErr := performTx(tx); nil != txErr {
 		switch txErr.code {
 		case TxErrCodeBlockNotFound:
 			util.PushTxErr("Transaction failed", txErr.code, nil)
 			return
-		case TxErrCodeUnableAccessFile:
-			util.PushTxErr(Conf.Language(76), txErr.code, txErr.id)
-			return
+		case TxErrCodeDataIsSyncing:
+			util.PushMsg(Conf.Language(222), 5000)
 		default:
-			logging.LogFatalf("transaction failed: %s", txErr.msg)
+			txData, _ := gulu.JSON.MarshalJSON(tx)
+			logging.LogFatalf(logging.ExitCodeFatal, "transaction failed [%d]: %s\n  tx [%s]", txErr.code, txErr.msg, txData)
 		}
 	}
 	elapsed := time.Now().Sub(start).Milliseconds()
-	if 0 < len(currentTx.DoOperations) {
+	if 0 < len(tx.DoOperations) {
 		if 2000 < elapsed {
-			logging.LogWarnf("tx [%dms]", elapsed)
+			logging.LogWarnf("op tx [%dms]", elapsed)
 		}
 	}
-	currentTx = nil
 }
 
-func mergeTx() (ret *Transaction) {
-	txQueueLock.Lock()
-	defer txQueueLock.Unlock()
-
-	ret = &Transaction{}
-	var doOps []*Operation
-	for _, tx := range txQueue {
-		for _, op := range tx.DoOperations {
-			if l := len(doOps); 0 < l {
-				lastOp := doOps[l-1]
-				if "update" == lastOp.Action && "update" == op.Action && lastOp.ID == op.ID { // 连续相同的更新操作
-					lastOp.discard = true
-				}
-			}
-			doOps = append(doOps, op)
-		}
+func PerformTransactions(transactions *[]*Transaction) {
+	for _, tx := range *transactions {
+		tx.m = &sync.Mutex{}
+		txQueue <- tx
 	}
-
-	for _, op := range doOps {
-		if !op.discard {
-			ret.DoOperations = append(ret.DoOperations, op)
-		}
-	}
-
-	txQueue = nil
-	return
-}
-
-func PerformTransactions(transactions *[]*Transaction) (err error) {
-	txQueueLock.Lock()
-	txQueue = append(txQueue, *transactions...)
-	txQueueLock.Unlock()
 	return
 }
 
 const (
-	TxErrCodeBlockNotFound    = 0
-	TxErrCodeUnableAccessFile = 1
-	TxErrCodeWriteTree        = 2
+	TxErrCodeBlockNotFound  = 0
+	TxErrCodeDataIsSyncing  = 1
+	TxErrCodeWriteTree      = 2
+	TxErrWriteAttributeView = 3
 )
 
 type TxErr struct {
@@ -183,12 +135,6 @@ type TxErr struct {
 
 func performTx(tx *Transaction) (ret *TxErr) {
 	if 1 > len(tx.DoOperations) {
-		txDelay -= 1000
-		if 100*txFixDelay < txDelay {
-			txDelay = txDelay / 2
-		} else if 0 > txDelay {
-			txDelay = txFixDelay
-		}
 		return
 	}
 
@@ -198,7 +144,7 @@ func performTx(tx *Transaction) (ret *TxErr) {
 	//defer pprof.StopCPUProfile()
 
 	var err error
-	if err = tx.begin(); nil != err {
+	if err = tx.begin(); err != nil {
 		if strings.Contains(err.Error(), "database is closed") {
 			return
 		}
@@ -207,7 +153,19 @@ func performTx(tx *Transaction) (ret *TxErr) {
 		return
 	}
 
-	start := time.Now()
+	defer func() {
+		if e := recover(); nil != e {
+			stack := debug.Stack()
+			msg := fmt.Sprintf("PANIC RECOVERED: %v\n\t%s\n", e, stack)
+			logging.LogErrorf(msg)
+
+			if 1 == tx.state.Load() {
+				tx.rollback()
+				return
+			}
+		}
+	}()
+
 	for _, op := range tx.DoOperations {
 		switch op.Action {
 		case "create":
@@ -220,6 +178,8 @@ func performTx(tx *Transaction) (ret *TxErr) {
 			ret = tx.doDelete(op)
 		case "move":
 			ret = tx.doMove(op)
+		case "moveOutlineHeading":
+			ret = tx.doMoveOutlineHeading(op)
 		case "append":
 			ret = tx.doAppend(op)
 		case "appendInsert":
@@ -231,7 +191,93 @@ func performTx(tx *Transaction) (ret *TxErr) {
 		case "unfoldHeading":
 			ret = tx.doUnfoldHeading(op)
 		case "setAttrs":
-			ret = tx.setAttrs(op)
+			ret = tx.doSetAttrs(op)
+		case "doUpdateUpdated":
+			ret = tx.doUpdateUpdated(op)
+		case "addFlashcards":
+			ret = tx.doAddFlashcards(op)
+		case "removeFlashcards":
+			ret = tx.doRemoveFlashcards(op)
+		case "setAttrViewName":
+			ret = tx.doSetAttrViewName(op)
+		case "setAttrViewFilters":
+			ret = tx.doSetAttrViewFilters(op)
+		case "setAttrViewSorts":
+			ret = tx.doSetAttrViewSorts(op)
+		case "setAttrViewPageSize":
+			ret = tx.doSetAttrViewPageSize(op)
+		case "setAttrViewColWidth":
+			ret = tx.doSetAttrViewColumnWidth(op)
+		case "setAttrViewColWrap":
+			ret = tx.doSetAttrViewColumnWrap(op)
+		case "setAttrViewColHidden":
+			ret = tx.doSetAttrViewColumnHidden(op)
+		case "setAttrViewColPin":
+			ret = tx.doSetAttrViewColumnPin(op)
+		case "setAttrViewColIcon":
+			ret = tx.doSetAttrViewColumnIcon(op)
+		case "setAttrViewColDesc":
+			ret = tx.doSetAttrViewColumnDesc(op)
+		case "insertAttrViewBlock":
+			ret = tx.doInsertAttrViewBlock(op)
+		case "removeAttrViewBlock":
+			ret = tx.doRemoveAttrViewBlock(op)
+		case "addAttrViewCol":
+			ret = tx.doAddAttrViewColumn(op)
+		case "updateAttrViewCol":
+			ret = tx.doUpdateAttrViewColumn(op)
+		case "removeAttrViewCol":
+			ret = tx.doRemoveAttrViewColumn(op)
+		case "sortAttrViewRow":
+			ret = tx.doSortAttrViewRow(op)
+		case "sortAttrViewCol":
+			ret = tx.doSortAttrViewColumn(op)
+		case "sortAttrViewKey":
+			ret = tx.doSortAttrViewKey(op)
+		case "updateAttrViewCell":
+			ret = tx.doUpdateAttrViewCell(op)
+		case "updateAttrViewColOptions":
+			ret = tx.doUpdateAttrViewColOptions(op)
+		case "removeAttrViewColOption":
+			ret = tx.doRemoveAttrViewColOption(op)
+		case "updateAttrViewColOption":
+			ret = tx.doUpdateAttrViewColOption(op)
+		case "setAttrViewColOptionDesc":
+			ret = tx.doSetAttrViewColOptionDesc(op)
+		case "setAttrViewColCalc":
+			ret = tx.doSetAttrViewColCalc(op)
+		case "updateAttrViewColNumberFormat":
+			ret = tx.doUpdateAttrViewColNumberFormat(op)
+		case "replaceAttrViewBlock":
+			ret = tx.doReplaceAttrViewBlock(op)
+		case "updateAttrViewColTemplate":
+			ret = tx.doUpdateAttrViewColTemplate(op)
+		case "addAttrViewView":
+			ret = tx.doAddAttrViewView(op)
+		case "removeAttrViewView":
+			ret = tx.doRemoveAttrViewView(op)
+		case "setAttrViewViewName":
+			ret = tx.doSetAttrViewViewName(op)
+		case "setAttrViewViewIcon":
+			ret = tx.doSetAttrViewViewIcon(op)
+		case "setAttrViewViewDesc":
+			ret = tx.doSetAttrViewViewDesc(op)
+		case "duplicateAttrViewView":
+			ret = tx.doDuplicateAttrViewView(op)
+		case "sortAttrViewView":
+			ret = tx.doSortAttrViewView(op)
+		case "updateAttrViewColRelation":
+			ret = tx.doUpdateAttrViewColRelation(op)
+		case "updateAttrViewColRollup":
+			ret = tx.doUpdateAttrViewColRollup(op)
+		case "hideAttrViewName":
+			ret = tx.doHideAttrViewName(op)
+		case "setAttrViewColDate":
+			ret = tx.doSetAttrViewColDate(op)
+		case "unbindAttrViewBlock":
+			ret = tx.doUnbindAttrViewBlock(op)
+		case "duplicateAttrViewKey":
+			ret = tx.doDuplicateAttrViewKey(op)
 		}
 
 		if nil != ret {
@@ -241,17 +287,8 @@ func performTx(tx *Transaction) (ret *TxErr) {
 	}
 
 	if cr := tx.commit(); nil != cr {
-		if errors.Is(cr, filelock.ErrUnableAccessFile) {
-			return &TxErr{code: TxErrCodeUnableAccessFile, msg: cr.Error()}
-		}
-
 		logging.LogErrorf("commit tx failed: %s", cr)
 		return &TxErr{msg: cr.Error()}
-	}
-	elapsed := int(time.Now().Sub(start).Milliseconds())
-	txDelay = 10 + elapsed
-	if 1000*10 < txDelay {
-		txDelay = 1000 * 10
 	}
 	return
 }
@@ -260,8 +297,8 @@ func (tx *Transaction) doMove(operation *Operation) (ret *TxErr) {
 	var err error
 	id := operation.ID
 	srcTree, err := tx.loadTree(id)
-	if nil != err {
-		logging.LogErrorf("load tree [id=%s] failed: %s", id, err)
+	if err != nil {
+		logging.LogErrorf("load tree [%s] failed: %s", id, err)
 		return &TxErr{code: TxErrCodeBlockNotFound, id: id}
 	}
 
@@ -274,7 +311,10 @@ func (tx *Transaction) doMove(operation *Operation) (ret *TxErr) {
 	var headingChildren []*ast.Node
 	if isMovingFoldHeading := ast.NodeHeading == srcNode.Type && "1" == srcNode.IALAttr("fold"); isMovingFoldHeading {
 		headingChildren = treenode.HeadingChildren(srcNode)
+		// Blocks below other non-folded headings are no longer moved when moving a folded heading https://github.com/siyuan-note/siyuan/issues/8321
+		headingChildren = treenode.GetHeadingFold(headingChildren)
 	}
+
 	var srcEmptyList *ast.Node
 	if ast.NodeListItem == srcNode.Type && srcNode.Parent.FirstChild == srcNode && srcNode.Parent.LastChild == srcNode {
 		// 列表中唯一的列表项被移除后，该列表就为空了
@@ -290,8 +330,8 @@ func (tx *Transaction) doMove(operation *Operation) (ret *TxErr) {
 
 		var targetTree *parse.Tree
 		targetTree, err = tx.loadTree(targetPreviousID)
-		if nil != err {
-			logging.LogErrorf("load tree [id=%s] failed: %s", targetPreviousID, err)
+		if err != nil {
+			logging.LogErrorf("load tree [%s] failed: %s", targetPreviousID, err)
 			return &TxErr{code: TxErrCodeBlockNotFound, id: targetPreviousID}
 		}
 		isSameTree := srcTree.ID == targetTree.ID
@@ -307,10 +347,21 @@ func (tx *Transaction) doMove(operation *Operation) (ret *TxErr) {
 
 		if ast.NodeHeading == targetNode.Type && "1" == targetNode.IALAttr("fold") {
 			targetChildren := treenode.HeadingChildren(targetNode)
+			targetChildren = treenode.GetHeadingFold(targetChildren)
+
 			if l := len(targetChildren); 0 < l {
 				targetNode = targetChildren[l-1]
 			}
 		}
+
+		if isMovingFoldHeadingIntoSelf(targetNode, headingChildren) {
+			return
+		}
+
+		if isMovingParentIntoChild(srcNode, targetNode) {
+			return
+		}
+
 		for i := len(headingChildren) - 1; -1 < i; i-- {
 			c := headingChildren[i]
 			targetNode.InsertAfter(c)
@@ -321,14 +372,17 @@ func (tx *Transaction) doMove(operation *Operation) (ret *TxErr) {
 		}
 
 		refreshUpdated(srcNode)
+		tx.nodes[srcNode.ID] = srcNode
 		refreshUpdated(srcTree.Root)
-		if err = tx.writeTree(srcTree); nil != err {
+		if err = tx.writeTree(srcTree); err != nil {
 			return
 		}
 		if !isSameTree {
-			if err = tx.writeTree(targetTree); nil != err {
+			if err = tx.writeTree(targetTree); err != nil {
 				return
 			}
+			task.AppendAsyncTaskWithDelay(task.SetDefRefCount, 1*time.Second, refreshRefCount, srcTree.ID, srcTree.ID)
+			task.AppendAsyncTaskWithDelay(task.SetDefRefCount, 1*time.Second, refreshRefCount, targetTree.ID, srcNode.ID)
 		}
 		return
 	}
@@ -338,8 +392,8 @@ func (tx *Transaction) doMove(operation *Operation) (ret *TxErr) {
 	}
 
 	targetTree, err := tx.loadTree(targetParentID)
-	if nil != err {
-		logging.LogErrorf("load tree [id=%s] failed: %s", targetParentID, err)
+	if err != nil {
+		logging.LogErrorf("load tree [%s] failed: %s", targetParentID, err)
 		return &TxErr{code: TxErrCodeBlockNotFound, id: targetParentID}
 	}
 	isSameTree := srcTree.ID == targetTree.ID
@@ -351,6 +405,14 @@ func (tx *Transaction) doMove(operation *Operation) (ret *TxErr) {
 	if nil == targetNode {
 		logging.LogErrorf("get node [%s] in tree [%s] failed", targetParentID, targetTree.Root.ID)
 		return &TxErr{code: TxErrCodeBlockNotFound, id: targetParentID}
+	}
+
+	if isMovingFoldHeadingIntoSelf(targetNode, headingChildren) {
+		return
+	}
+
+	if isMovingParentIntoChild(srcNode, targetNode) {
+		return
 	}
 
 	processed := false
@@ -395,39 +457,57 @@ func (tx *Transaction) doMove(operation *Operation) (ret *TxErr) {
 	}
 
 	refreshUpdated(srcNode)
+	tx.nodes[srcNode.ID] = srcNode
 	refreshUpdated(srcTree.Root)
-	if err = tx.writeTree(srcTree); nil != err {
+	if err = tx.writeTree(srcTree); err != nil {
 		return &TxErr{code: TxErrCodeWriteTree, msg: err.Error(), id: id}
 	}
 	if !isSameTree {
-		if err = tx.writeTree(targetTree); nil != err {
+		if err = tx.writeTree(targetTree); err != nil {
 			return &TxErr{code: TxErrCodeWriteTree, msg: err.Error(), id: id}
 		}
+		task.AppendAsyncTaskWithDelay(task.SetDefRefCount, 1*time.Second, refreshRefCount, srcTree.ID, srcTree.ID)
+		task.AppendAsyncTaskWithDelay(task.SetDefRefCount, 1*time.Second, refreshRefCount, targetTree.ID, srcNode.ID)
 	}
 	return
+}
+
+func isMovingFoldHeadingIntoSelf(targetNode *ast.Node, headingChildren []*ast.Node) bool {
+	for _, headingChild := range headingChildren {
+		if headingChild.ID == targetNode.ID {
+			// 不能将折叠标题移动到自己下方节点的前或后 https://github.com/siyuan-note/siyuan/issues/7163
+			return true
+		}
+	}
+	return false
+}
+
+func isMovingParentIntoChild(srcNode, targetNode *ast.Node) bool {
+	for parent := targetNode.Parent; nil != parent; parent = parent.Parent {
+		if parent.ID == srcNode.ID {
+			return true
+		}
+	}
+	return false
 }
 
 func (tx *Transaction) doPrependInsert(operation *Operation) (ret *TxErr) {
 	var err error
 	block := treenode.GetBlockTree(operation.ParentID)
 	if nil == block {
-		msg := fmt.Sprintf("not found parent block [id=%s]", operation.ParentID)
-		logging.LogErrorf(msg)
-		return &TxErr{code: TxErrCodeBlockNotFound, id: operation.ParentID}
+		logging.LogWarnf("not found block [%s]", operation.ParentID)
+		util.ReloadUI() // 比如分屏后编辑器状态不一致，这里强制重新载入界面
+		return
 	}
 	tree, err := tx.loadTree(block.ID)
-	if errors.Is(err, filelock.ErrUnableAccessFile) {
-		return &TxErr{code: TxErrCodeUnableAccessFile, msg: err.Error(), id: block.ID}
-	}
-	if nil != err {
-		msg := fmt.Sprintf("load tree [id=%s] failed: %s", block.ID, err)
+	if err != nil {
+		msg := fmt.Sprintf("load tree [%s] failed: %s", block.ID, err)
 		logging.LogErrorf(msg)
 		return &TxErr{code: TxErrCodeBlockNotFound, id: block.ID}
 	}
 
 	data := strings.ReplaceAll(operation.Data.(string), editor.FrontEndCaret, "")
-	luteEngine := NewLute()
-	subTree := luteEngine.BlockDOM2Tree(data)
+	subTree := tx.luteEngine.BlockDOM2Tree(data)
 	insertedNode := subTree.Root.FirstChild
 	if nil == insertedNode {
 		return &TxErr{code: TxErrCodeBlockNotFound, msg: "invalid data tree", id: block.ID}
@@ -480,7 +560,7 @@ func (tx *Transaction) doPrependInsert(operation *Operation) (ret *TxErr) {
 	}
 	createdUpdated(insertedNode)
 	tx.nodes[insertedNode.ID] = insertedNode
-	if err = tx.writeTree(tree); nil != err {
+	if err = tx.writeTree(tree); err != nil {
 		return &TxErr{code: TxErrCodeWriteTree, msg: err.Error(), id: block.ID}
 	}
 
@@ -499,23 +579,19 @@ func (tx *Transaction) doAppendInsert(operation *Operation) (ret *TxErr) {
 	var err error
 	block := treenode.GetBlockTree(operation.ParentID)
 	if nil == block {
-		msg := fmt.Sprintf("not found parent block [id=%s]", operation.ParentID)
-		logging.LogErrorf(msg)
-		return &TxErr{code: TxErrCodeBlockNotFound, id: operation.ParentID}
+		logging.LogWarnf("not found block [%s]", operation.ParentID)
+		util.ReloadUI() // 比如分屏后编辑器状态不一致，这里强制重新载入界面
+		return
 	}
 	tree, err := tx.loadTree(block.ID)
-	if errors.Is(err, filelock.ErrUnableAccessFile) {
-		return &TxErr{code: TxErrCodeUnableAccessFile, msg: err.Error(), id: block.ID}
-	}
-	if nil != err {
-		msg := fmt.Sprintf("load tree [id=%s] failed: %s", block.ID, err)
+	if err != nil {
+		msg := fmt.Sprintf("load tree [%s] failed: %s", block.ID, err)
 		logging.LogErrorf(msg)
 		return &TxErr{code: TxErrCodeBlockNotFound, id: block.ID}
 	}
 
 	data := strings.ReplaceAll(operation.Data.(string), editor.FrontEndCaret, "")
-	luteEngine := NewLute()
-	subTree := luteEngine.BlockDOM2Tree(data)
+	subTree := tx.luteEngine.BlockDOM2Tree(data)
 	insertedNode := subTree.Root.FirstChild
 	if nil == insertedNode {
 		return &TxErr{code: TxErrCodeBlockNotFound, msg: "invalid data tree", id: block.ID}
@@ -544,7 +620,24 @@ func (tx *Transaction) doAppendInsert(operation *Operation) (ret *TxErr) {
 	for i := 0; i < len(toInserts); i++ {
 		toInsert := toInserts[i]
 		if isContainer {
-			if ast.NodeSuperBlock == node.Type {
+			if ast.NodeList == node.Type {
+				// 列表下只能挂列表项，所以这里需要分情况处理 https://github.com/siyuan-note/siyuan/issues/9955
+				if ast.NodeList == toInsert.Type {
+					var childLis []*ast.Node
+					for childLi := toInsert.FirstChild; nil != childLi; childLi = childLi.Next {
+						childLis = append(childLis, childLi)
+					}
+					for _, childLi := range childLis {
+						node.AppendChild(childLi)
+					}
+				} else {
+					newLiID := ast.NewNodeID()
+					newLi := &ast.Node{ID: newLiID, Type: ast.NodeListItem, ListData: &ast.ListData{Typ: node.ListData.Typ}}
+					newLi.SetIALAttr("id", newLiID)
+					node.AppendChild(newLi)
+					newLi.AppendChild(toInsert)
+				}
+			} else if ast.NodeSuperBlock == node.Type {
 				node.LastChild.InsertBefore(toInsert)
 			} else {
 				node.AppendChild(toInsert)
@@ -556,7 +649,7 @@ func (tx *Transaction) doAppendInsert(operation *Operation) (ret *TxErr) {
 
 	createdUpdated(insertedNode)
 	tx.nodes[insertedNode.ID] = insertedNode
-	if err = tx.writeTree(tree); nil != err {
+	if err = tx.writeTree(tree); err != nil {
 		return &TxErr{code: TxErrCodeWriteTree, msg: err.Error(), id: block.ID}
 	}
 
@@ -575,8 +668,8 @@ func (tx *Transaction) doAppend(operation *Operation) (ret *TxErr) {
 	var err error
 	id := operation.ID
 	srcTree, err := tx.loadTree(id)
-	if nil != err {
-		logging.LogErrorf("load tree [id=%s] failed: %s", id, err)
+	if err != nil {
+		logging.LogErrorf("load tree [%s] failed: %s", id, err)
 		return &TxErr{code: TxErrCodeBlockNotFound, id: id}
 	}
 
@@ -613,8 +706,8 @@ func (tx *Transaction) doAppend(operation *Operation) (ret *TxErr) {
 	}
 
 	targetTree, err := tx.loadTree(targetRootID)
-	if nil != err {
-		logging.LogErrorf("load tree [id=%s] failed: %s", targetRootID, err)
+	if err != nil {
+		logging.LogErrorf("load tree [%s] failed: %s", targetRootID, err)
 		return &TxErr{code: TxErrCodeBlockNotFound, id: targetRootID}
 	}
 	isSameTree := srcTree.ID == targetTree.ID
@@ -644,12 +737,12 @@ func (tx *Transaction) doAppend(operation *Operation) (ret *TxErr) {
 		srcEmptyList.Unlink()
 	}
 
-	if err = tx.writeTree(srcTree); nil != err {
+	if err = tx.writeTree(srcTree); err != nil {
 		return &TxErr{code: TxErrCodeWriteTree, msg: err.Error(), id: id}
 	}
 
 	if !isSameTree {
-		if err = tx.writeTree(targetTree); nil != err {
+		if err = tx.writeTree(targetTree); err != nil {
 			return &TxErr{code: TxErrCodeWriteTree, msg: err.Error(), id: id}
 		}
 	}
@@ -662,15 +755,13 @@ func (tx *Transaction) doDelete(operation *Operation) (ret *TxErr) {
 	var err error
 	id := operation.ID
 	tree, err := tx.loadTree(id)
-	if errors.Is(err, filelock.ErrUnableAccessFile) {
-		return &TxErr{code: TxErrCodeUnableAccessFile, msg: err.Error(), id: id}
-	}
-	if ErrBlockNotFound == err {
-		return nil // move 以后这里会空，算作正常情况
-	}
+	if err != nil {
+		if errors.Is(err, ErrBlockNotFound) {
+			// move 以后这里会空，算作正常情况
+			return
+		}
 
-	if nil != err {
-		msg := fmt.Sprintf("load tree [id=%s] failed: %s", id, err)
+		msg := fmt.Sprintf("load tree [%s] failed: %s", id, err)
 		logging.LogErrorf(msg)
 		return &TxErr{code: TxErrCodeBlockNotFound, id: id}
 	}
@@ -680,23 +771,184 @@ func (tx *Transaction) doDelete(operation *Operation) (ret *TxErr) {
 		return nil // move 以后的情况，列表项移动导致的状态异常 https://github.com/siyuan-note/insider/issues/961
 	}
 
+	// 收集引用的定义块 ID
+	refDefIDs := getRefDefIDs(node)
+	// 推送定义节点引用计数
+	for _, defID := range refDefIDs {
+		defTree, _ := LoadTreeByBlockID(defID)
+		if nil != defTree {
+			defNode := treenode.GetNodeInTree(defTree, defID)
+			if nil != defNode {
+				task.AppendAsyncTaskWithDelay(task.SetDefRefCount, 1*time.Second, refreshRefCount, defTree.ID, defNode.ID)
+			}
+		}
+	}
+
 	parent := node.Parent
 	if nil != node.Next && ast.NodeKramdownBlockIAL == node.Next.Type && bytes.Contains(node.Next.Tokens, []byte(node.ID)) {
 		// 列表块撤销状态异常 https://github.com/siyuan-note/siyuan/issues/3985
 		node.Next.Unlink()
 	}
+
 	node.Unlink()
 	if nil != parent && ast.NodeListItem == parent.Type && nil == parent.FirstChild {
-		// 保持空列表项
-		node.FirstChild = nil
-		parent.AppendChild(node)
+		needAppendEmptyListItem := true
+		for _, op := range tx.DoOperations {
+			if "insert" == op.Action && op.ParentID == parent.ID {
+				needAppendEmptyListItem = false
+				break
+			}
+		}
+
+		if needAppendEmptyListItem {
+			parent.AppendChild(treenode.NewParagraph(ast.NewNodeID()))
+		}
 	}
 	treenode.RemoveBlockTree(node.ID)
 
 	delete(tx.nodes, node.ID)
-	if err = tx.writeTree(tree); nil != err {
+	if err = tx.writeTree(tree); err != nil {
 		return
 	}
+
+	// 如果是断开列表时的删除列表项事务，则不需要删除数据库绑定块，因为断开列表事务后面会再次插入相同 ID 的列表项
+	// List item disconnection no longer affects database binding blocks https://github.com/siyuan-note/siyuan/issues/12235
+	needSyncDel2AvBlock := true
+	if ast.NodeListItem == node.Type {
+		for _, op := range tx.DoOperations {
+			// 不可能出现相同 ID 先插入再删除的情况，只可能出现先删除再插入的情况，所以这里只需要查找插入操作
+			if "insert" == op.Action {
+				data := strings.ReplaceAll(op.Data.(string), editor.FrontEndCaret, "")
+				subTree := tx.luteEngine.BlockDOM2Tree(data)
+				ast.Walk(subTree.Root, func(n *ast.Node, entering bool) ast.WalkStatus {
+					if !entering || ast.NodeListItem != n.Type {
+						return ast.WalkContinue
+					}
+
+					if n.ID == operation.ID {
+						needSyncDel2AvBlock = false
+						return ast.WalkStop
+					}
+					return ast.WalkContinue
+				})
+
+				break
+			}
+		}
+	}
+
+	if needSyncDel2AvBlock {
+		syncDelete2AvBlock(node, tree, tx)
+	}
+	return
+}
+
+func syncDelete2AvBlock(node *ast.Node, nodeTree *parse.Tree, tx *Transaction) {
+	changedAvIDs := syncDelete2AttributeView(node)
+	avIDs := tx.syncDelete2Block(node, nodeTree)
+	changedAvIDs = append(changedAvIDs, avIDs...)
+	changedAvIDs = gulu.Str.RemoveDuplicatedElem(changedAvIDs)
+
+	for _, avID := range changedAvIDs {
+		ReloadAttrView(avID)
+	}
+}
+
+func (tx *Transaction) syncDelete2Block(node *ast.Node, nodeTree *parse.Tree) (changedAvIDs []string) {
+	ast.Walk(node, func(n *ast.Node, entering bool) ast.WalkStatus {
+		if !entering || ast.NodeAttributeView != n.Type {
+			return ast.WalkContinue
+		}
+
+		avID := n.AttributeViewID
+		isMirror := av.IsMirror(avID)
+		if changed := av.RemoveBlockRel(avID, n.ID, treenode.ExistBlockTree); changed {
+			changedAvIDs = append(changedAvIDs, avID)
+		}
+
+		if isMirror {
+			// 删除镜像数据库节点后不需要解绑块，因为其他镜像节点还在使用
+			return ast.WalkContinue
+		}
+
+		attrView, err := av.ParseAttributeView(avID)
+		if err != nil {
+			return ast.WalkContinue
+		}
+
+		trees, nodes := tx.getAttrViewBoundNodes(attrView)
+		for _, toChangNode := range nodes {
+			avs := toChangNode.IALAttr(av.NodeAttrNameAvs)
+			if "" != avs {
+				avIDs := strings.Split(avs, ",")
+				avIDs = gulu.Str.RemoveElem(avIDs, avID)
+				if 1 > len(avIDs) {
+					toChangNode.RemoveIALAttr(av.NodeAttrNameAvs)
+				} else {
+					toChangNode.SetIALAttr(av.NodeAttrNameAvs, strings.Join(avIDs, ","))
+				}
+			}
+			avNames := getAvNames(toChangNode.IALAttr(av.NodeAttrNameAvs))
+			oldAttrs := parse.IAL2Map(toChangNode.KramdownIAL)
+			toChangNode.SetIALAttr(av.NodeAttrViewNames, avNames)
+			pushBroadcastAttrTransactions(oldAttrs, toChangNode)
+		}
+
+		nodeTreeID := nodeTree.ID
+		for _, tree := range trees {
+			self := nodeTreeID == tree.ID
+			if !self {
+				indexWriteTreeUpsertQueue(tree)
+			}
+		}
+		return ast.WalkContinue
+	})
+
+	changedAvIDs = gulu.Str.RemoveDuplicatedElem(changedAvIDs)
+	return
+}
+
+func syncDelete2AttributeView(node *ast.Node) (changedAvIDs []string) {
+	ast.Walk(node, func(n *ast.Node, entering bool) ast.WalkStatus {
+		if !entering || !n.IsBlock() {
+			return ast.WalkContinue
+		}
+
+		avs := n.IALAttr(av.NodeAttrNameAvs)
+		if "" == avs {
+			return ast.WalkContinue
+		}
+
+		avIDs := strings.Split(avs, ",")
+		for _, avID := range avIDs {
+			attrView, parseErr := av.ParseAttributeView(avID)
+			if nil != parseErr {
+				continue
+			}
+
+			changedAv := false
+			blockValues := attrView.GetBlockKeyValues()
+			if nil == blockValues {
+				continue
+			}
+
+			for i, blockValue := range blockValues.Values {
+				if blockValue.Block.ID == n.ID {
+					blockValues.Values = append(blockValues.Values[:i], blockValues.Values[i+1:]...)
+					changedAv = true
+					break
+				}
+			}
+
+			if changedAv {
+				av.SaveAttributeView(attrView)
+				changedAvIDs = append(changedAvIDs, avID)
+			}
+		}
+		return ast.WalkContinue
+	})
+
+	changedAvIDs = gulu.Str.RemoveDuplicatedElem(changedAvIDs)
 	return
 }
 
@@ -711,24 +963,20 @@ func (tx *Transaction) doInsert(operation *Operation) (ret *TxErr) {
 		}
 	}
 	if nil == block {
-		msg := fmt.Sprintf("not found next block [id=%s]", operation.NextID)
-		logging.LogErrorf(msg)
-		return &TxErr{code: TxErrCodeBlockNotFound, id: operation.NextID}
+		logging.LogWarnf("not found block [%s, %s, %s]", operation.ParentID, operation.PreviousID, operation.NextID)
+		util.ReloadUI() // 比如分屏后编辑器状态不一致，这里强制重新载入界面
+		return
 	}
 
 	tree, err := tx.loadTree(block.ID)
-	if errors.Is(err, filelock.ErrUnableAccessFile) {
-		return &TxErr{code: TxErrCodeUnableAccessFile, msg: err.Error(), id: block.ID}
-	}
-	if nil != err {
-		msg := fmt.Sprintf("load tree [id=%s] failed: %s", block.ID, err)
+	if err != nil {
+		msg := fmt.Sprintf("load tree [%s] failed: %s", block.ID, err)
 		logging.LogErrorf(msg)
 		return &TxErr{code: TxErrCodeBlockNotFound, id: block.ID}
 	}
 
 	data := strings.ReplaceAll(operation.Data.(string), editor.FrontEndCaret, "")
-	luteEngine := NewLute()
-	subTree := luteEngine.BlockDOM2Tree(data)
+	subTree := tx.luteEngine.BlockDOM2Tree(data)
 
 	p := block.Path
 	assets := getAssetsDir(filepath.Join(util.DataDir, block.BoxID), filepath.Dir(filepath.Join(util.DataDir, block.BoxID, p)))
@@ -755,7 +1003,7 @@ func (tx *Transaction) doInsert(operation *Operation) (ret *TxErr) {
 
 				// 只有全局 assets 才移动到相对 assets
 				targetP := filepath.Join(assets, filepath.Base(assetPath))
-				if e = filelock.Move(assetPath, targetP); nil != err {
+				if e = filelock.Rename(assetPath, targetP); err != nil {
 					logging.LogErrorf("copy path of asset from [%s] to [%s] failed: %s", assetPath, targetP, err)
 					return ast.WalkContinue
 				}
@@ -850,24 +1098,64 @@ func (tx *Transaction) doInsert(operation *Operation) (ret *TxErr) {
 
 	createdUpdated(insertedNode)
 	tx.nodes[insertedNode.ID] = insertedNode
-	if err = tx.writeTree(tree); nil != err {
+	if err = tx.writeTree(tree); err != nil {
 		return &TxErr{code: TxErrCodeWriteTree, msg: err.Error(), id: block.ID}
+	}
+
+	// 收集引用的定义块 ID
+	refDefIDs := getRefDefIDs(insertedNode)
+	// 推送定义节点引用计数
+	for _, defID := range refDefIDs {
+		defTree, _ := LoadTreeByBlockID(defID)
+		if nil != defTree {
+			defNode := treenode.GetNodeInTree(defTree, defID)
+			if nil != defNode {
+				task.AppendAsyncTaskWithDelay(task.SetDefRefCount, 1*time.Second, refreshRefCount, defTree.ID, defNode.ID)
+			}
+		}
+	}
+
+	upsertAvBlockRel(insertedNode)
+
+	// 复制为副本时将该副本块插入到数据库中 https://github.com/siyuan-note/siyuan/issues/11959
+	avs := insertedNode.IALAttr(av.NodeAttrNameAvs)
+	for _, avID := range strings.Split(avs, ",") {
+		if !ast.IsNodeIDPattern(avID) {
+			continue
+		}
+
+		AddAttributeViewBlock(tx, []map[string]interface{}{{
+			"id":         insertedNode.ID,
+			"isDetached": false,
+		}}, avID, "", previousID, false)
+		ReloadAttrView(avID)
+	}
+
+	// 插入数据库块时需要重新绑定其中已经存在的块
+	// 比如剪切操作时，会先进行 delete 数据库解绑块，这里需要重新绑定 https://github.com/siyuan-note/siyuan/issues/13031
+	if ast.NodeAttributeView == insertedNode.Type {
+		attrView, parseErr := av.ParseAttributeView(insertedNode.AttributeViewID)
+		if nil == parseErr {
+			trees, toBindNodes := tx.getAttrViewBoundNodes(attrView)
+			for _, toBindNode := range toBindNodes {
+				t := trees[toBindNode.ID]
+				bindBlockAv0(tx, insertedNode.AttributeViewID, toBindNode, t)
+			}
+		}
 	}
 
 	operation.ID = insertedNode.ID
 	operation.ParentID = insertedNode.Parent.ID
+
+	checkUpsertInUserGuide(tree)
 	return
 }
 
 func (tx *Transaction) doUpdate(operation *Operation) (ret *TxErr) {
 	id := operation.ID
-
 	tree, err := tx.loadTree(id)
-	if errors.Is(err, filelock.ErrUnableAccessFile) {
-		return &TxErr{code: TxErrCodeUnableAccessFile, msg: err.Error(), id: id}
-	}
-	if nil != err {
-		logging.LogErrorf("load tree [id=%s] failed: %s", id, err)
+	if err != nil {
+		logging.LogErrorf("load tree [%s] failed: %s", id, err)
 		return &TxErr{code: TxErrCodeBlockNotFound, id: id}
 	}
 
@@ -877,8 +1165,7 @@ func (tx *Transaction) doUpdate(operation *Operation) (ret *TxErr) {
 		return &TxErr{code: TxErrCodeBlockNotFound, id: id}
 	}
 
-	luteEngine := NewLute()
-	subTree := luteEngine.BlockDOM2Tree(data)
+	subTree := tx.luteEngine.BlockDOM2Tree(data)
 	subTree.ID, subTree.Box, subTree.Path = tree.ID, tree.Box, tree.Path
 	oldNode := treenode.GetNodeInTree(tree, id)
 	if nil == oldNode {
@@ -886,21 +1173,20 @@ func (tx *Transaction) doUpdate(operation *Operation) (ret *TxErr) {
 		return &TxErr{msg: ErrBlockNotFound.Error(), id: id}
 	}
 
+	// 收集引用的定义块 ID
+	oldDefIDs := getRefDefIDs(oldNode)
+	var newDefIDs []string
+
 	var unlinks []*ast.Node
 	ast.Walk(subTree.Root, func(n *ast.Node, entering bool) ast.WalkStatus {
 		if !entering {
 			return ast.WalkContinue
 		}
 
-		if ast.NodeInlineMath == n.Type {
-			content := n.ChildByType(ast.NodeInlineMathContent)
-			if nil == content || 1 > len(content.Tokens) {
-				// 剔除空白的行级公式
-				unlinks = append(unlinks, n)
-			}
-		} else if ast.NodeTextMark == n.Type {
+		if ast.NodeTextMark == n.Type {
 			if n.IsTextMarkType("inline-math") {
 				if "" == strings.TrimSpace(n.TextMarkInlineMathContent) {
+					// 剔除空白的行级公式
 					unlinks = append(unlinks, n)
 				}
 			} else if n.IsTextMarkType("block-ref") {
@@ -913,15 +1199,32 @@ func (tx *Transaction) doUpdate(operation *Operation) (ret *TxErr) {
 						n.TextMarkTextContent = dRefText.(string)
 					}
 				}
+
+				newDefIDs = append(newDefIDs, n.TextMarkBlockRefID)
 			}
-		} else if ast.NodeBlockRef == n.Type {
-			sql.CacheRef(subTree, n)
 		}
 		return ast.WalkContinue
 	})
-
 	for _, n := range unlinks {
 		n.Unlink()
+	}
+
+	oldDefIDs = gulu.Str.RemoveDuplicatedElem(oldDefIDs)
+	newDefIDs = gulu.Str.RemoveDuplicatedElem(newDefIDs)
+	refDefIDs := oldDefIDs
+
+	if !slices.Equal(oldDefIDs, newDefIDs) { // 如果引用发生了变化，则推送定义节点引用计数
+		refDefIDs = append(refDefIDs, newDefIDs...)
+		refDefIDs = gulu.Str.RemoveDuplicatedElem(refDefIDs)
+		for _, defID := range refDefIDs {
+			defTree, _ := LoadTreeByBlockID(defID)
+			if nil != defTree {
+				defNode := treenode.GetNodeInTree(defTree, defID)
+				if nil != defNode {
+					task.AppendAsyncTaskWithDelay(task.SetDefRefCount, 1*time.Second, refreshRefCount, defTree.ID, defNode.ID)
+				}
+			}
+		}
 	}
 
 	updatedNode := subTree.Root.FirstChild
@@ -945,8 +1248,111 @@ func (tx *Transaction) doUpdate(operation *Operation) (ret *TxErr) {
 	oldNode.Unlink()
 
 	createdUpdated(updatedNode)
+
 	tx.nodes[updatedNode.ID] = updatedNode
-	if err = tx.writeTree(tree); nil != err {
+	if err = tx.writeTree(tree); err != nil {
+		return &TxErr{code: TxErrCodeWriteTree, msg: err.Error(), id: id}
+	}
+
+	upsertAvBlockRel(updatedNode)
+
+	checkUpsertInUserGuide(tree)
+	return
+}
+
+func getRefDefIDs(node *ast.Node) (refDefIDs []string) {
+	ast.Walk(node, func(n *ast.Node, entering bool) ast.WalkStatus {
+		if !entering {
+			return ast.WalkContinue
+		}
+
+		if treenode.IsBlockRef(n) {
+			refDefIDs = append(refDefIDs, n.TextMarkBlockRefID)
+		} else if treenode.IsEmbedBlockRef(n) {
+			defID := treenode.GetEmbedBlockRef(n)
+			refDefIDs = append(refDefIDs, defID)
+		}
+		return ast.WalkContinue
+	})
+	refDefIDs = gulu.Str.RemoveDuplicatedElem(refDefIDs)
+	return
+}
+
+func upsertAvBlockRel(node *ast.Node) {
+	var affectedAvIDs []string
+	ast.Walk(node, func(n *ast.Node, entering bool) ast.WalkStatus {
+		if !entering {
+			return ast.WalkContinue
+		}
+
+		if ast.NodeAttributeView == n.Type {
+			avID := n.AttributeViewID
+			if changed := av.UpsertBlockRel(avID, n.ID); changed {
+				affectedAvIDs = append(affectedAvIDs, avID)
+			}
+		}
+		return ast.WalkContinue
+	})
+
+	updatedNodes := []*ast.Node{node}
+	var parents []*ast.Node
+	for parent := node.Parent; nil != parent && ast.NodeDocument != parent.Type; parent = parent.Parent {
+		parents = append(parents, parent)
+	}
+	updatedNodes = append(updatedNodes, parents...)
+	for _, updatedNode := range updatedNodes {
+		ast.Walk(updatedNode, func(n *ast.Node, entering bool) ast.WalkStatus {
+			avs := n.IALAttr(av.NodeAttrNameAvs)
+			if "" == avs {
+				return ast.WalkContinue
+			}
+
+			avIDs := strings.Split(avs, ",")
+			affectedAvIDs = append(affectedAvIDs, avIDs...)
+			return ast.WalkContinue
+		})
+	}
+
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		sql.FlushQueue()
+
+		affectedAvIDs = gulu.Str.RemoveDuplicatedElem(affectedAvIDs)
+		var relatedAvIDs []string
+		for _, avID := range affectedAvIDs {
+			relatedAvIDs = append(relatedAvIDs, av.GetSrcAvIDs(avID)...)
+		}
+		affectedAvIDs = append(affectedAvIDs, relatedAvIDs...)
+		affectedAvIDs = gulu.Str.RemoveDuplicatedElem(affectedAvIDs)
+		for _, avID := range affectedAvIDs {
+			ReloadAttrView(avID)
+		}
+	}()
+}
+
+func (tx *Transaction) doUpdateUpdated(operation *Operation) (ret *TxErr) {
+	id := operation.ID
+	tree, err := tx.loadTree(id)
+	if err != nil {
+		if errors.Is(err, ErrBlockNotFound) {
+			logging.LogWarnf("not found block [%s]", id)
+			return
+		}
+
+		logging.LogErrorf("load tree [%s] failed: %s", id, err)
+		return &TxErr{code: TxErrCodeBlockNotFound, id: id}
+	}
+
+	node := treenode.GetNodeInTree(tree, id)
+	if nil == node {
+		logging.LogErrorf("get node [%s] in tree [%s] failed", id, tree.Root.ID)
+		return &TxErr{msg: ErrBlockNotFound.Error(), id: id}
+	}
+
+	node.SetIALAttr("updated", operation.Data.(string))
+	createdUpdated(node)
+	tx.nodes[node.ID] = node
+	if err = tx.writeTree(tree); err != nil {
 		return &TxErr{code: TxErrCodeWriteTree, msg: err.Error(), id: id}
 	}
 	return
@@ -955,14 +1361,16 @@ func (tx *Transaction) doUpdate(operation *Operation) (ret *TxErr) {
 func (tx *Transaction) doCreate(operation *Operation) (ret *TxErr) {
 	tree := operation.Data.(*parse.Tree)
 	tx.writeTree(tree)
+
+	checkUpsertInUserGuide(tree)
 	return
 }
 
-func (tx *Transaction) setAttrs(operation *Operation) (ret *TxErr) {
+func (tx *Transaction) doSetAttrs(operation *Operation) (ret *TxErr) {
 	id := operation.ID
 	tree, err := tx.loadTree(id)
-	if nil != err {
-		logging.LogErrorf("load tree [id=%s] failed: %s", id, err)
+	if err != nil {
+		logging.LogErrorf("load tree [%s] failed: %s", id, err)
 		return &TxErr{code: TxErrCodeBlockNotFound, id: id}
 	}
 
@@ -973,7 +1381,7 @@ func (tx *Transaction) setAttrs(operation *Operation) (ret *TxErr) {
 	}
 
 	attrs := map[string]string{}
-	if err = gulu.JSON.UnmarshalJSON([]byte(operation.Data.(string)), &attrs); nil != err {
+	if err = gulu.JSON.UnmarshalJSON([]byte(operation.Data.(string)), &attrs); err != nil {
 		logging.LogErrorf("unmarshal attrs failed: %s", err)
 		return &TxErr{code: TxErrCodeBlockNotFound, id: id}
 	}
@@ -999,34 +1407,49 @@ func (tx *Transaction) setAttrs(operation *Operation) (ret *TxErr) {
 		}
 	}
 
-	if err = indexWriteJSONQueue(tree); nil != err {
+	if err = tx.writeTree(tree); err != nil {
 		return
 	}
 	cache.PutBlockIAL(id, parse.IAL2Map(node.KramdownIAL))
 	return
 }
 
-func refreshUpdated(n *ast.Node) {
+func refreshUpdated(node *ast.Node) {
 	updated := util.CurrentTimeSecondsStr()
-	n.SetIALAttr("updated", updated)
-	parents := treenode.ParentNodes(n)
+	node.SetIALAttr("updated", updated)
+	parents := treenode.ParentNodesWithHeadings(node)
 	for _, parent := range parents { // 更新所有父节点的更新时间字段
 		parent.SetIALAttr("updated", updated)
 	}
 }
 
 func createdUpdated(node *ast.Node) {
+	// 补全子节点的更新时间 Improve block update time filling https://github.com/siyuan-note/siyuan/issues/12182
+	ast.Walk(node, func(n *ast.Node, entering bool) ast.WalkStatus {
+		if !entering || !n.IsBlock() || ast.NodeKramdownBlockIAL == n.Type {
+			return ast.WalkContinue
+		}
+
+		updated := n.IALAttr("updated")
+		if "" == updated && ast.IsNodeIDPattern(n.ID) {
+			created := util.TimeFromID(n.ID)
+			n.SetIALAttr("updated", created)
+		}
+		return ast.WalkContinue
+	})
+
 	created := util.TimeFromID(node.ID)
 	updated := node.IALAttr("updated")
 	if "" == updated {
 		updated = created
 	}
 	if updated < created {
-		updated = created // 复制粘贴块后创建时间小于更新时间 https://github.com/siyuan-note/siyuan/issues/3624
+		updated = created
 	}
-	parents := treenode.ParentNodes(node)
+	parents := treenode.ParentNodesWithHeadings(node)
 	for _, parent := range parents { // 更新所有父节点的更新时间字段
 		parent.SetIALAttr("updated", updated)
+		cache.PutBlockIAL(parent.ID, parse.IAL2Map(parent.KramdownIAL))
 	}
 }
 
@@ -1038,41 +1461,79 @@ type Operation struct {
 	PreviousID string      `json:"previousID"`
 	NextID     string      `json:"nextID"`
 	RetData    interface{} `json:"retData"`
+	BlockIDs   []string    `json:"blockIDs"`
+	BlockID    string      `json:"blockID"`
 
-	discard bool // 用于标识是否在事务合并中丢弃
+	DeckID string `json:"deckID"` // 用于添加/删除闪卡
+
+	AvID                string                   `json:"avID"`              // 属性视图 ID
+	SrcIDs              []string                 `json:"srcIDs"`            // 用于从属性视图中删除行
+	Srcs                []map[string]interface{} `json:"srcs"`              // 用于添加属性视图行（包括绑定块）{id, content, isDetached}
+	IsDetached          bool                     `json:"isDetached"`        // 用于标识是否未绑定块，仅存在于属性视图中
+	IgnoreFillFilterVal bool                     `json:"ignoreFillFilter"`  // 用于标识是否忽略填充筛选值
+	Name                string                   `json:"name"`              // 属性视图列名
+	Typ                 string                   `json:"type"`              // 属性视图列类型
+	Format              string                   `json:"format"`            // 属性视图列格式化
+	KeyID               string                   `json:"keyID"`             // 属性视列 ID
+	RowID               string                   `json:"rowID"`             // 属性视图行 ID
+	IsTwoWay            bool                     `json:"isTwoWay"`          // 属性视图关联列是否是双向关系
+	BackRelationKeyID   string                   `json:"backRelationKeyID"` // 属性视图关联列回链关联列的 ID
+	RemoveDest          bool                     `json:"removeDest"`        // 属性视图删除关联目标
 }
 
 type Transaction struct {
+	Timestamp      int64        `json:"timestamp"`
 	DoOperations   []*Operation `json:"doOperations"`
 	UndoOperations []*Operation `json:"undoOperations"`
 
 	trees map[string]*parse.Tree
 	nodes map[string]*ast.Node
+
+	luteEngine *lute.Lute
+	m          *sync.Mutex
+	state      atomic.Int32 // 0: 初始化，1：未提交，:2: 已提交，3: 已回滚
+}
+
+func (tx *Transaction) WaitForCommit() {
+	for {
+		if 1 == tx.state.Load() {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		return
+	}
 }
 
 func (tx *Transaction) begin() (err error) {
-	if nil != err {
-		return
-	}
 	tx.trees = map[string]*parse.Tree{}
 	tx.nodes = map[string]*ast.Node{}
+	tx.luteEngine = util.NewLute()
+	tx.m.Lock()
+	tx.state.Store(1)
 	return
 }
 
 func (tx *Transaction) commit() (err error) {
 	for _, tree := range tx.trees {
-		if err = writeJSONQueue(tree); nil != err {
+		if err = writeTreeUpsertQueue(tree); err != nil {
 			return
 		}
+
+		var sources []interface{}
+		sources = append(sources, tx)
+		util.PushSaveDoc(tree.ID, "tx", sources)
 	}
-	refreshDynamicRefText(tx.nodes, tx.trees)
+	refreshDynamicRefTexts(tx.nodes, tx.trees)
 	IncSync()
-	tx.trees = nil
+	tx.state.Store(2)
+	tx.m.Unlock()
 	return
 }
 
 func (tx *Transaction) rollback() {
 	tx.trees, tx.nodes = nil, nil
+	tx.state.Store(3)
+	tx.m.Unlock()
 	return
 }
 
@@ -1091,8 +1552,8 @@ func (tx *Transaction) loadTree(id string) (ret *parse.Tree, err error) {
 		return
 	}
 
-	ret, err = LoadTree(box, p)
-	if nil != err {
+	ret, err = filesys.LoadTree(box, p, tx.luteEngine)
+	if err != nil {
 		return
 	}
 	tx.trees[rootID] = ret
@@ -1101,73 +1562,28 @@ func (tx *Transaction) loadTree(id string) (ret *parse.Tree, err error) {
 
 func (tx *Transaction) writeTree(tree *parse.Tree) (err error) {
 	tx.trees[tree.ID] = tree
-	treenode.ReindexBlockTree(tree)
+	treenode.UpsertBlockTree(tree)
 	return
 }
 
-func refreshDynamicRefText(updatedDefNodes map[string]*ast.Node, updatedTrees map[string]*parse.Tree) {
-	// 这个实现依赖了数据库缓存，导致外部调用时可能需要阻塞等待数据库写入后才能获取到 refs
-
-	treeRefNodeIDs := map[string]*hashset.Set{}
-	for _, updateNode := range updatedDefNodes {
-		refs := sql.GetRefsCacheByDefID(updateNode.ID)
-		if nil != updateNode.Parent && ast.NodeDocument != updateNode.Parent.Type &&
-			updateNode.Parent.IsContainerBlock() && (updateNode == treenode.FirstLeafBlock(updateNode.Parent)) { // 容器块下第一个子块
-			var parentRefs []*sql.Ref
-			if ast.NodeListItem == updateNode.Parent.Type { // 引用列表块时动态锚文本未跟随定义块内容变动 https://github.com/siyuan-note/siyuan/issues/4393
-				parentRefs = sql.GetRefsCacheByDefID(updateNode.Parent.Parent.ID)
-				updatedDefNodes[updateNode.Parent.ID] = updateNode.Parent
-				updatedDefNodes[updateNode.Parent.Parent.ID] = updateNode.Parent.Parent
-			} else {
-				parentRefs = sql.GetRefsCacheByDefID(updateNode.Parent.ID)
-				updatedDefNodes[updateNode.Parent.ID] = updateNode.Parent
+func getRefsCacheByDefNode(updateNode *ast.Node) (ret []*sql.Ref, changedParentNodes []*ast.Node) {
+	ret = sql.GetRefsCacheByDefID(updateNode.ID)
+	if nil != updateNode.Parent && ast.NodeDocument != updateNode.Parent.Type &&
+		updateNode.Parent.IsContainerBlock() && updateNode == treenode.FirstLeafBlock(updateNode.Parent) { // 容器块下第一个叶子块
+		// 如果是容器块下第一个叶子块，则需要向上查找引用
+		for parent := updateNode.Parent; nil != parent; parent = parent.Parent {
+			if ast.NodeDocument == parent.Type {
+				break
 			}
 
+			parentRefs := sql.GetRefsCacheByDefID(parent.ID)
 			if 0 < len(parentRefs) {
-				refs = append(refs, parentRefs...)
-			}
-		}
-		for _, ref := range refs {
-			if refIDs, ok := treeRefNodeIDs[ref.RootID]; !ok {
-				refIDs = hashset.New()
-				refIDs.Add(ref.BlockID)
-				treeRefNodeIDs[ref.RootID] = refIDs
-			} else {
-				refIDs.Add(ref.BlockID)
+				ret = append(ret, parentRefs...)
+				changedParentNodes = append(changedParentNodes, parent)
 			}
 		}
 	}
-
-	for refTreeID, refNodeIDs := range treeRefNodeIDs {
-		refTree, ok := updatedTrees[refTreeID]
-		if !ok {
-			var err error
-			refTree, err = loadTreeByBlockID(refTreeID)
-			if nil != err {
-				continue
-			}
-		}
-
-		var refTreeChanged bool
-		ast.Walk(refTree.Root, func(n *ast.Node, entering bool) ast.WalkStatus {
-			if !entering {
-				return ast.WalkContinue
-			}
-
-			if n.IsBlock() && refNodeIDs.Contains(n.ID) {
-				changed := updateRefText(n, updatedDefNodes)
-				if !refTreeChanged && changed {
-					refTreeChanged = true
-				}
-				return ast.WalkContinue
-			}
-			return ast.WalkContinue
-		})
-
-		if refTreeChanged {
-			indexWriteJSONQueue(refTree)
-		}
-	}
+	return
 }
 
 var updateRefTextRenameDocs = map[string]*parse.Tree{}
@@ -1179,11 +1595,9 @@ func updateRefTextRenameDoc(renamedTree *parse.Tree) {
 	updateRefTextRenameDocLock.Unlock()
 }
 
-func autoFlushUpdateRefTextRenameDoc() {
-	for {
-		sql.WaitForWritingDatabase()
-		flushUpdateRefTextRenameDoc()
-	}
+func FlushUpdateRefTextRenameDocJob() {
+	sql.FlushQueue()
+	flushUpdateRefTextRenameDoc()
 }
 
 func flushUpdateRefTextRenameDoc() {
@@ -1191,36 +1605,57 @@ func flushUpdateRefTextRenameDoc() {
 	defer updateRefTextRenameDocLock.Unlock()
 
 	for _, tree := range updateRefTextRenameDocs {
-		changedDefs := map[string]*ast.Node{tree.ID: tree.Root}
-		changedTrees := map[string]*parse.Tree{tree.ID: tree}
-		refreshDynamicRefText(changedDefs, changedTrees)
+		refreshDynamicRefText(tree.Root, tree)
 	}
 	updateRefTextRenameDocs = map[string]*parse.Tree{}
 }
 
-func updateRefText(refNode *ast.Node, changedDefNodes map[string]*ast.Node) (changed bool) {
+type changedDefNode struct {
+	id      string
+	refText string
+	refType string // ref-d/ref-s/embed
+}
+
+func updateRefText(refNode *ast.Node, changedDefNodes map[string]*ast.Node) (changed bool, defNodes []*changedDefNode) {
 	ast.Walk(refNode, func(n *ast.Node, entering bool) ast.WalkStatus {
 		if !entering {
 			return ast.WalkContinue
 		}
-		if !treenode.IsBlockRef(n) {
+		if treenode.IsBlockRef(n) {
+			defID, refText, subtype := treenode.GetBlockRef(n)
+			if "" == defID {
+				return ast.WalkContinue
+			}
+
+			defNode := changedDefNodes[defID]
+			if nil == defNode {
+				return ast.WalkSkipChildren
+			}
+
+			changed = true
+			if "d" == subtype {
+				refText = strings.TrimSpace(getNodeRefText(defNode))
+				if "" == refText {
+					refText = n.TextMarkBlockRefID
+				}
+				treenode.SetDynamicBlockRefText(n, refText)
+			}
+			defNodes = append(defNodes, &changedDefNode{id: defID, refText: refText, refType: "ref-" + subtype})
+			return ast.WalkContinue
+		} else if treenode.IsEmbedBlockRef(n) {
+			defID := treenode.GetEmbedBlockRef(n)
+			changed = true
+			defNodes = append(defNodes, &changedDefNode{id: defID, refType: "embed"})
 			return ast.WalkContinue
 		}
-
-		defID, _, subtype := treenode.GetBlockRef(n)
-		if "s" == subtype || "" == defID {
-			return ast.WalkContinue
-		}
-
-		defNode := changedDefNodes[defID]
-		if nil == defNode {
-			return ast.WalkSkipChildren
-		}
-
-		refText := getNodeRefText(defNode)
-		treenode.SetDynamicBlockRefText(n, refText)
-		changed = true
 		return ast.WalkContinue
 	})
 	return
+}
+
+func checkUpsertInUserGuide(tree *parse.Tree) {
+	// In production mode, data reset warning pops up when editing data in the user guide https://github.com/siyuan-note/siyuan/issues/9757
+	if "prod" == util.Mode && IsUserGuide(tree.Box) {
+		util.PushErrMsg(Conf.Language(52), 7000)
+	}
 }

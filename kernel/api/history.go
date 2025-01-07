@@ -1,4 +1,4 @@
-// SiYuan - Build Your Eternal Digital Garden
+// SiYuan - Refactor your thinking
 // Copyright (c) 2020-present, b3log.org
 //
 // This program is free software: you can redistribute it and/or modify
@@ -96,12 +96,7 @@ func reindexHistory(c *gin.Context) {
 	ret := gulu.Ret.NewResult()
 	defer c.JSON(http.StatusOK, ret)
 
-	err := model.ReindexHistory()
-	if nil != err {
-		ret.Code = -1
-		ret.Msg = err.Error()
-		return
-	}
+	model.ReindexHistory()
 }
 
 func getNotebookHistory(c *gin.Context) {
@@ -109,7 +104,7 @@ func getNotebookHistory(c *gin.Context) {
 	defer c.JSON(http.StatusOK, ret)
 
 	histories, err := model.GetNotebookHistory()
-	if nil != err {
+	if err != nil {
 		ret.Code = -1
 		ret.Msg = err.Error()
 		return
@@ -127,14 +122,12 @@ func clearWorkspaceHistory(c *gin.Context) {
 	msgId := util.PushMsg(model.Conf.Language(100), 1000*60*15)
 	time.Sleep(3 * time.Second)
 	err := model.ClearWorkspaceHistory()
-	if nil != err {
+	if err != nil {
 		ret.Code = -1
 		ret.Msg = err.Error()
 		return
 	}
-	util.PushClearMsg(msgId)
-	time.Sleep(500 * time.Millisecond)
-	util.PushMsg(model.Conf.Language(99), 1000*5)
+	util.PushUpdateMsg(msgId, model.Conf.Language(99), 1000*5)
 }
 
 func getDocHistoryContent(c *gin.Context) {
@@ -152,8 +145,12 @@ func getDocHistoryContent(c *gin.Context) {
 	if nil != k {
 		keyword = k.(string)
 	}
-	id, rootID, content, isLargeDoc, err := model.GetDocHistoryContent(historyPath, keyword)
-	if nil != err {
+	highlight := true
+	if val, ok := arg["highlight"]; ok {
+		highlight = val.(bool)
+	}
+	id, rootID, content, isLargeDoc, err := model.GetDocHistoryContent(historyPath, keyword, highlight)
+	if err != nil {
 		ret.Code = -1
 		ret.Msg = err.Error()
 		return
@@ -179,7 +176,7 @@ func rollbackDocHistory(c *gin.Context) {
 	notebook := arg["notebook"].(string)
 	historyPath := arg["historyPath"].(string)
 	err := model.RollbackDocHistory(notebook, historyPath)
-	if nil != err {
+	if err != nil {
 		ret.Code = -1
 		ret.Msg = err.Error()
 		return
@@ -201,7 +198,7 @@ func rollbackAssetsHistory(c *gin.Context) {
 
 	historyPath := arg["historyPath"].(string)
 	err := model.RollbackAssetsHistory(historyPath)
-	if nil != err {
+	if err != nil {
 		ret.Code = -1
 		ret.Msg = err.Error()
 		return
@@ -219,7 +216,7 @@ func rollbackNotebookHistory(c *gin.Context) {
 
 	historyPath := arg["historyPath"].(string)
 	err := model.RollbackNotebookHistory(historyPath)
-	if nil != err {
+	if err != nil {
 		ret.Code = -1
 		ret.Msg = err.Error()
 		return
