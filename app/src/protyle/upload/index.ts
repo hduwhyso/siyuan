@@ -6,6 +6,10 @@ import {fetchPost} from "../../util/fetch";
 import {getEditorRange} from "../util/selection";
 import {pathPosix} from "../../util/pathName";
 import {genAssetHTML} from "../../asset/renderAssets";
+import {hasClosestBlock} from "../util/hasClosest";
+import {getContenteditableElement} from "../wysiwyg/getBlock";
+import {getTypeByCellElement, updateCellsValue} from "../render/av/cell";
+import {scrollCenter} from "../../util/highlightById";
 
 export class Upload {
     public element: HTMLElement;
@@ -96,26 +100,105 @@ const genUploadedLabel = (responseText: string, protyle: IProtyle) => {
     if (errorTip) {
         showMessage(errorTip);
     }
-
-    let succFileText = "";
+    let insertBlock = true;
+    const range = getEditorRange(protyle.wysiwyg.element);
+    if (range.toString() === "" && range.startContainer.nodeType === 3 && protyle.toolbar.getCurrentType(range).length > 0) {
+        // 防止链接插入其他元素中 https://ld246.com/article/1676003478664
+        range.setEndAfter(range.startContainer.parentElement);
+        range.collapse(false);
+    }
+    // https://github.com/siyuan-note/siyuan/issues/7624
+    const nodeElement = hasClosestBlock(range.startContainer);
+    if (nodeElement) {
+        if (nodeElement.classList.contains("table")) {
+            insertBlock = false;
+        } else {
+            const editableElement = getContenteditableElement(nodeElement);
+            if (editableElement && editableElement.textContent !== "" && nodeElement.classList.contains("p")) {
+                insertBlock = false;
+            }
+        }
+    }
+    let successFileText = "";
     const keys = Object.keys(response.data.succMap);
+    const avAssets: IAVCellAssetValue[] = [];
+    let hasImage = false;
     keys.forEach((key, index) => {
         const path = response.data.succMap[key];
         const type = pathPosix().extname(key).toLowerCase();
         const filename = protyle.options.upload.filename(key);
-        succFileText += genAssetHTML(type, path, filename.substring(0, filename.length - type.length), filename);
+        const name = filename.substring(0, filename.length - type.length);
+        hasImage = Constants.SIYUAN_ASSETS_IMAGE.includes(type);
+        avAssets.push({
+            type: Constants.SIYUAN_ASSETS_IMAGE.includes(type) ? "image" : "file",
+            content: path,
+            name: name
+        });
+        successFileText += genAssetHTML(type, path, name, filename);
         if (!Constants.SIYUAN_ASSETS_AUDIO.includes(type) && !Constants.SIYUAN_ASSETS_VIDEO.includes(type) &&
             keys.length - 1 !== index) {
-            succFileText += "\n";
+            if (nodeElement && nodeElement.classList.contains("table")) {
+                successFileText += "<br>";
+            } else if (insertBlock) {
+                successFileText += "\n\n";
+            } else {
+                successFileText += "\n";
+            }
         }
     });
-    const range = getEditorRange(protyle.wysiwyg.element);
-    if (!succFileText.startsWith("<") && range.toString() === "" && range.startContainer.nodeType === 3 && protyle.toolbar.getCurrentType(range).length > 0) {
-        // 防止链接插入其他元素中
-        range.setEndAfter(range.startContainer.parentElement);
-        range.collapse(false);
+
+    if ((nodeElement && nodeElement.classList.contains("av"))) {
+        const cellElements: HTMLElement[] = [];
+        nodeElement.querySelectorAll(".av__row--select:not(.av__row--header)").forEach(item => {
+            item.querySelectorAll(".av__cell").forEach((cellItem: HTMLElement) => {
+                if (getTypeByCellElement(cellItem) === "mAsset") {
+                    cellElements.push(cellItem);
+                }
+            });
+        });
+        if (cellElements.length === 0) {
+            protyle.wysiwyg.element.querySelectorAll(".av__cell--active").forEach((item: HTMLElement) => {
+                if (getTypeByCellElement(item) === "mAsset") {
+                    cellElements.push(item);
+                }
+            });
+        }
+        if (cellElements.length > 0) {
+            updateCellsValue(protyle, nodeElement, avAssets, cellElements);
+            document.querySelector(".av__panel")?.remove();
+            return;
+        } else {
+            return;
+        }
     }
-    insertHTML(succFileText, protyle);
+
+    if (document.querySelector(".av__panel")) {
+        const cellElements: HTMLElement[] = [document.querySelector('.custom-attr__avvalue[data-type="mAsset"][data-active="true"]')];
+        if (!cellElements[0]) {
+            cellElements.splice(0, 1);
+            protyle.wysiwyg.element.querySelectorAll(".av__cell--active").forEach((item: HTMLElement) => {
+                if (getTypeByCellElement(item) === "mAsset") {
+                    cellElements.push(item);
+                }
+            });
+        }
+        if (cellElements.length > 0) {
+            const blockElement = hasClosestBlock(cellElements[0]);
+            if (blockElement) {
+                updateCellsValue(protyle, blockElement, avAssets, cellElements);
+                document.querySelector(".av__panel")?.remove();
+                return;
+            }
+        } else {
+            return;
+        }
+    }
+    // 避免插入代码块中，其次因为都要独立成块 https://github.com/siyuan-note/siyuan/issues/7607
+    insertHTML(successFileText, protyle, insertBlock);
+    // 粘贴图片后定位不准确 https://github.com/siyuan-note/siyuan/issues/13336
+    setTimeout(() => {
+        scrollCenter(protyle, undefined, false, "smooth");
+    }, hasImage ? 0 : Constants.TIMEOUT_LOAD);
 };
 
 export const uploadLocalFiles = (files: string[], protyle: IProtyle, isUpload: boolean) => {
@@ -126,11 +209,45 @@ export const uploadLocalFiles = (files: string[], protyle: IProtyle, isUpload: b
         id: protyle.block.rootID
     }, (response) => {
         hideMessage(msgId);
+        let tip = "";
+        Object.keys(response.data.succMap).forEach(name => {
+            if (response.data.succMap[name].startsWith("file:")) {
+                tip += name + ", ";
+            }
+        });
+        if (tip) {
+            showMessage(window.siyuan.languages.dndFolderTip.replace("${x}", `<b>${tip.substring(0, tip.length - 2)}</b>`));
+        }
         genUploadedLabel(JSON.stringify(response), protyle);
     });
 };
 
 export const uploadFiles = (protyle: IProtyle, files: FileList | DataTransferItemList | File[], element?: HTMLInputElement, successCB?: (res: string) => void) => {
+    // 文档书中点开属性->数据库后的变更操作
+    if (!protyle) {
+        const formData = new FormData();
+        for (let i = 0, iMax = files.length; i < iMax; i++) {
+            formData.append("file[]", files[i] as File);
+        }
+        const xhr = new XMLHttpRequest();
+        xhr.open("POST", Constants.UPLOAD_ADDRESS);
+        xhr.onreadystatechange = () => {
+            if (xhr.readyState === XMLHttpRequest.DONE) {
+                if (xhr.status === 200) {
+                    successCB(xhr.responseText);
+                } else if (xhr.status === 0) {
+                    showMessage(window.siyuan.languages.fileTypeError);
+                } else {
+                    showMessage(xhr.responseText);
+                }
+                if (element) {
+                    element.value = "";
+                }
+            }
+        };
+        xhr.send(formData);
+        return;
+    }
     // FileList | DataTransferItemList | File[] => File[]
     let fileList = [];
     for (let i = 0; i < files.length; i++) {

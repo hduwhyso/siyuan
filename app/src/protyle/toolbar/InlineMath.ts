@@ -19,7 +19,7 @@ export class InlineMath extends ToolbarItem {
             let mathElement = hasClosestByAttribute(range.startContainer, "data-type", "inline-math") as Element;
             if (!mathElement && range.startContainer.nodeType !== 3 && range.startContainer.childNodes[range.startOffset]) {
                 const previousSibling = hasPreviousSibling(range.startContainer.childNodes[range.startOffset]) as HTMLElement;
-                if (previousSibling && previousSibling.getAttribute("data-type").indexOf("inline-math") > -1) {
+                if (previousSibling && previousSibling.nodeType !==3 && previousSibling.getAttribute("data-type").indexOf("inline-math") > -1) {
                     mathElement = previousSibling;
                 }
             }
@@ -28,7 +28,7 @@ export class InlineMath extends ToolbarItem {
                 let hasMath = false;
                 // https://github.com/siyuan-note/siyuan/issues/6007
                 range.cloneContents().childNodes.forEach((item: HTMLElement) => {
-                    if ((item.nodeType !== 3 && item.getAttribute("data-type").indexOf("inline-math") > -1) ||
+                    if ((item.nodeType !== 3 && (item.getAttribute("data-type") || "").indexOf("inline-math") > -1) ||
                         (item.nodeType == 3 && item.textContent === "")) {
                         // 是否仅选中数学公式
                         hasMath = true;

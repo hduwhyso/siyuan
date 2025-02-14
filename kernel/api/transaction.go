@@ -1,4 +1,4 @@
-// SiYuan - Build Your Eternal Digital Garden
+// SiYuan - Refactor your thinking
 // Copyright (c) 2020-present, b3log.org
 //
 // This program is free software: you can redistribute it and/or modify
@@ -17,17 +17,14 @@
 package api
 
 import (
-	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/88250/gulu"
 	"github.com/gin-gonic/gin"
-	"github.com/siyuan-note/filelock"
-	"github.com/siyuan-note/logging"
 	"github.com/siyuan-note/siyuan/kernel/model"
-	"github.com/siyuan-note/siyuan/kernel/sql"
 	"github.com/siyuan-note/siyuan/kernel/util"
 )
 
@@ -43,7 +40,7 @@ func performTransactions(c *gin.Context) {
 
 	trans := arg["transactions"]
 	data, err := gulu.JSON.MarshalJSON(trans)
-	if nil != err {
+	if err != nil {
 		ret.Code = -1
 		ret.Msg = "parses request failed"
 		return
@@ -56,46 +53,53 @@ func performTransactions(c *gin.Context) {
 		return
 	}
 
+	timestamp := int64(arg["reqId"].(float64))
 	var transactions []*model.Transaction
-	if err = gulu.JSON.UnmarshalJSON(data, &transactions); nil != err {
+	if err = gulu.JSON.UnmarshalJSON(data, &transactions); err != nil {
 		ret.Code = -1
 		ret.Msg = "parses request failed"
 		return
 	}
+	for _, transaction := range transactions {
+		transaction.Timestamp = timestamp
+	}
 
-	if err = model.PerformTransactions(&transactions); errors.Is(err, filelock.ErrUnableAccessFile) {
-		ret.Code = 1
-		return
-	}
-	if nil != err {
-		tx, txErr := sql.BeginTx()
-		if nil != txErr {
-			logging.LogFatalf("transaction failed: %s", txErr)
-			return
-		}
-		sql.ClearBoxHash(tx)
-		sql.CommitTx(tx)
-		logging.LogFatalf("transaction failed: %s", err)
-		return
-	}
+	model.PerformTransactions(&transactions)
 
 	ret.Data = transactions
 
 	app := arg["app"].(string)
 	session := arg["session"].(string)
-	if model.IsFoldHeading(&transactions) || model.IsUnfoldHeading(&transactions) {
-		model.WaitForWritingFiles()
-	}
 	pushTransactions(app, session, transactions)
+
+	if model.IsMoveOutlineHeading(&transactions) {
+		if retData := transactions[0].DoOperations[0].RetData; nil != retData {
+			util.PushReloadDoc(retData.(string))
+		}
+	}
 
 	elapsed := time.Now().Sub(start).Milliseconds()
 	c.Header("Server-Timing", fmt.Sprintf("total;dur=%d", elapsed))
 }
 
 func pushTransactions(app, session string, transactions []*model.Transaction) {
-	evt := util.NewCmdResult("transactions", 0, util.PushModeBroadcastExcludeSelf, util.PushModeBroadcastExcludeSelf)
+	pushMode := util.PushModeBroadcastExcludeSelf
+	if 0 < len(transactions) && 0 < len(transactions[0].DoOperations) {
+		model.FlushTxQueue() // 等待文件写入完成，后续渲染才能读取到最新的数据
+
+		action := transactions[0].DoOperations[0].Action
+		isAttrViewTx := strings.Contains(strings.ToLower(action), "attrview")
+		if isAttrViewTx && "setAttrViewName" != action {
+			pushMode = util.PushModeBroadcast
+		}
+	}
+
+	evt := util.NewCmdResult("transactions", 0, pushMode)
 	evt.AppId = app
 	evt.SessionId = session
 	evt.Data = transactions
+	for _, tx := range transactions {
+		tx.WaitForCommit()
+	}
 	util.PushEvent(evt)
 }

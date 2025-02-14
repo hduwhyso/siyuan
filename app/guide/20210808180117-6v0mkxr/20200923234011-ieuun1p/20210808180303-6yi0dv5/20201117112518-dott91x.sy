@@ -6,7 +6,7 @@
 		"id": "20201117112518-dott91x",
 		"title": "Embed Content Block",
 		"type": "doc",
-		"updated": "20221007175159"
+		"updated": "20240731204825"
 	},
 	"Children": [
 		{
@@ -68,33 +68,11 @@
 					"Data": ", database table please refer to "
 				},
 				{
-					"Type": "NodeBlockRef",
-					"Data": "span",
-					"Children": [
-						{
-							"Type": "NodeOpenParen"
-						},
-						{
-							"Type": "NodeOpenParen"
-						},
-						{
-							"Type": "NodeBlockRefID",
-							"Data": "20201117103851-gx21lz6"
-						},
-						{
-							"Type": "NodeBlockRefSpace"
-						},
-						{
-							"Type": "NodeBlockRefText",
-							"Data": "here"
-						},
-						{
-							"Type": "NodeCloseParen"
-						},
-						{
-							"Type": "NodeCloseParen"
-						}
-					]
+					"Type": "NodeTextMark",
+					"TextMarkType": "block-ref",
+					"TextMarkBlockRefID": "20201117103851-gx21lz6",
+					"TextMarkBlockRefSubtype": "s",
+					"TextMarkTextContent": "here"
 				},
 				{
 					"Type": "NodeText",
@@ -441,7 +419,8 @@
 			"Type": "NodeBlockQueryEmbed",
 			"Properties": {
 				"id": "20210111231445-gwfrxnl",
-				"updated": "20211222185405"
+				"style": "height: 1120px;",
+				"updated": "20240508085416"
 			},
 			"Children": [
 				{
@@ -452,7 +431,7 @@
 				},
 				{
 					"Type": "NodeBlockQueryEmbedScript",
-					"Data": "SELECT * FROM blocks WHERE content LIKE '%In SiYuan%' AND content LIKE '%core concept%' AND hpath NOT LIKE '%Embed Content Block%'"
+					"Data": "SELECT * FROM blocks WHERE content LIKE '%In SiYuan%' AND content LIKE '%core concept%' AND type = 'p' AND hpath NOT LIKE '%Embed Content Block%'"
 				},
 				{
 					"Type": "NodeCloseBrace"
@@ -467,7 +446,8 @@
 			"Type": "NodeHeading",
 			"HeadingLevel": 3,
 			"Properties": {
-				"id": "20201224120448-gx2xvjh"
+				"id": "20201224120448-gx2xvjh",
+				"updated": "20240731204825"
 			},
 			"Children": [
 				{
@@ -485,12 +465,12 @@
 			"Type": "NodeParagraph",
 			"Properties": {
 				"id": "20201224120448-e0ohbtq",
-				"updated": "20220623201429"
+				"updated": "20240731204825"
 			},
 			"Children": [
 				{
 					"Type": "NodeText",
-					"Data": "Query paragraph blocks that contain both tags "
+					"Data": "Query for paragraph blocks containing the tag "
 				},
 				{
 					"Type": "NodeTextMark",
@@ -499,7 +479,7 @@
 				},
 				{
 					"Type": "NodeText",
-					"Data": " and "
+					"Data": "​ or "
 				},
 				{
 					"Type": "NodeTextMark",
@@ -508,7 +488,7 @@
 				},
 				{
 					"Type": "NodeText",
-					"Data": ":"
+					"Data": "​:"
 				}
 			]
 		},

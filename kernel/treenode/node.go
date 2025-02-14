@@ -1,4 +1,4 @@
-// SiYuan - Build Your Eternal Digital Garden
+// SiYuan - Refactor your thinking
 // Copyright (c) 2020-present, b3log.org
 //
 // This program is free software: you can redistribute it and/or modify
@@ -21,45 +21,78 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/88250/gulu"
 	"github.com/88250/lute"
 	"github.com/88250/lute/ast"
 	"github.com/88250/lute/editor"
 	"github.com/88250/lute/html"
-	"github.com/88250/lute/lex"
 	"github.com/88250/lute/parse"
 	"github.com/88250/lute/render"
-	"github.com/88250/lute/util"
+	"github.com/88250/vitess-sqlparser/sqlparser"
 	"github.com/siyuan-note/logging"
+	"github.com/siyuan-note/siyuan/kernel/cache"
+	"github.com/siyuan-note/siyuan/kernel/util"
 )
+
+func GetEmbedBlockRef(embedNode *ast.Node) (blockRefID string) {
+	if nil == embedNode || ast.NodeBlockQueryEmbed != embedNode.Type {
+		return
+	}
+
+	scriptNode := embedNode.ChildByType(ast.NodeBlockQueryEmbedScript)
+	if nil == scriptNode {
+		return
+	}
+
+	stmt := scriptNode.TokensStr()
+	parsedStmt, err := sqlparser.Parse(stmt)
+	if err != nil {
+		return
+	}
+
+	switch parsedStmt.(type) {
+	case *sqlparser.Select:
+		slct := parsedStmt.(*sqlparser.Select)
+		if nil == slct.Where || nil == slct.Where.Expr {
+			return
+		}
+
+		switch slct.Where.Expr.(type) {
+		case *sqlparser.ComparisonExpr: // WHERE id = '20060102150405-1a2b3c4'
+			comp := slct.Where.Expr.(*sqlparser.ComparisonExpr)
+			switch comp.Left.(type) {
+			case *sqlparser.ColName:
+				col := comp.Left.(*sqlparser.ColName)
+				if nil == col || "id" != col.Name.Lowered() {
+					return
+				}
+			}
+			switch comp.Right.(type) {
+			case *sqlparser.SQLVal:
+				val := comp.Right.(*sqlparser.SQLVal)
+				if nil == val || sqlparser.StrVal != val.Type {
+					return
+				}
+
+				idVal := string(val.Val)
+				if !ast.IsNodeIDPattern(idVal) {
+					return
+				}
+				blockRefID = idVal
+			}
+		}
+	}
+	return
+}
 
 func GetBlockRef(n *ast.Node) (blockRefID, blockRefText, blockRefSubtype string) {
 	if !IsBlockRef(n) {
 		return
 	}
-	if ast.NodeBlockRef == n.Type {
-		id := n.ChildByType(ast.NodeBlockRefID)
-		if nil == id {
-			return
-		}
-		blockRefID = id.TokensStr()
-		text := n.ChildByType(ast.NodeBlockRefText)
-		if nil != text {
-			blockRefText = text.Text()
-			blockRefSubtype = "s"
-			return
-		}
-		text = n.ChildByType(ast.NodeBlockRefDynamicText)
-		if nil != text {
-			blockRefText = text.Text()
-			blockRefSubtype = "d"
-			return
-		}
-	}
-	if ast.NodeTextMark == n.Type {
-		blockRefID = n.TextMarkBlockRefID
-		blockRefText = n.TextMarkTextContent
-		blockRefSubtype = n.TextMarkBlockRefSubtype
-	}
+
+	blockRefID = n.TextMarkBlockRefID
+	blockRefText = n.TextMarkTextContent
+	blockRefSubtype = n.TextMarkBlockRefSubtype
 	return
 }
 
@@ -67,104 +100,89 @@ func IsBlockRef(n *ast.Node) bool {
 	if nil == n {
 		return false
 	}
-	if ast.NodeBlockRef == n.Type {
-		return true
-	}
-	if ast.NodeTextMark == n.Type {
-		return n.IsTextMarkType("block-ref")
-	}
-	return false
+	return (ast.NodeTextMark == n.Type && n.IsTextMarkType("block-ref")) || ast.NodeBlockRef == n.Type
 }
 
-func NodeStaticMdContent(node *ast.Node, luteEngine *lute.Lute) (md, content string) {
-	md = ExportNodeStdMd(node, luteEngine)
-	content = NodeStaticContent(node)
-	return
+func IsBlockLink(n *ast.Node) bool {
+	if nil == n {
+		return false
+	}
+	return ast.NodeTextMark == n.Type && n.IsTextMarkType("a") && strings.HasPrefix(n.TextMarkAHref, "siyuan://blocks/")
+}
+
+func IsFileAnnotationRef(n *ast.Node) bool {
+	if nil == n {
+		return false
+	}
+	return ast.NodeTextMark == n.Type && n.IsTextMarkType("file-annotation-ref")
+}
+
+func IsEmbedBlockRef(n *ast.Node) bool {
+	return "" != GetEmbedBlockRef(n)
 }
 
 func FormatNode(node *ast.Node, luteEngine *lute.Lute) string {
 	markdown, err := lute.FormatNodeSync(node, luteEngine.ParseOptions, luteEngine.RenderOptions)
-	if nil != err {
+	if err != nil {
 		root := TreeRoot(node)
-		logging.LogFatalf("format node [%s] in tree [%s] failed: %s", node.ID, root.ID, err)
+		logging.LogFatalf(logging.ExitCodeFatal, "format node [%s] in tree [%s] failed: %s", node.ID, root.ID, err)
 	}
 	return markdown
 }
 
 func ExportNodeStdMd(node *ast.Node, luteEngine *lute.Lute) string {
 	markdown, err := lute.ProtyleExportMdNodeSync(node, luteEngine.ParseOptions, luteEngine.RenderOptions)
-	if nil != err {
+	if err != nil {
 		root := TreeRoot(node)
-		logging.LogFatalf("export markdown for node [%s] in tree [%s] failed: %s", node.ID, root.ID, err)
+		logging.LogFatalf(logging.ExitCodeFatal, "export markdown for node [%s] in tree [%s] failed: %s", node.ID, root.ID, err)
 	}
 	return markdown
 }
 
-func NodeStaticContent(node *ast.Node) string {
-	if nil == node {
-		return ""
+func IsNodeOCRed(node *ast.Node) (ret bool) {
+	if !util.TesseractEnabled || nil == node {
+		return true
 	}
 
-	if ast.NodeDocument == node.Type {
-		return node.IALAttr("title")
-	}
-
-	buf := bytes.Buffer{}
-	buf.Grow(4096)
-	lastSpace := false
+	ret = true
 	ast.Walk(node, func(n *ast.Node, entering bool) ast.WalkStatus {
 		if !entering {
 			return ast.WalkContinue
 		}
 
-		if n.IsContainerBlock() {
-			if !lastSpace {
-				buf.WriteString(" ")
-				lastSpace = true
+		if ast.NodeImage == n.Type {
+			linkDest := n.ChildByType(ast.NodeLinkDest)
+			if nil == linkDest {
+				return ast.WalkContinue
 			}
-			return ast.WalkContinue
-		}
 
-		switch n.Type {
-		case ast.NodeTagOpenMarker, ast.NodeTagCloseMarker:
-			buf.WriteByte('#')
-		case ast.NodeBlockRef:
-			buf.WriteString(GetDynamicBlockRefText(n))
-			lastSpace = false
-			return ast.WalkSkipChildren
-		case ast.NodeLinkText:
-			buf.Write(n.Tokens)
-			buf.WriteByte(' ')
-		case ast.NodeLinkDest:
-			buf.Write(n.Tokens)
-			buf.WriteByte(' ')
-		case ast.NodeLinkTitle:
-			buf.Write(n.Tokens)
-		case ast.NodeText, ast.NodeFileAnnotationRefText, ast.NodeFootnotesRef,
-			ast.NodeCodeSpanContent, ast.NodeInlineMathContent, ast.NodeCodeBlockCode, ast.NodeMathBlockContent, ast.NodeHTMLBlock:
-			tokens := n.Tokens
-			if IsChartCodeBlockCode(n) {
-				// 图表块的内容在数据库 `blocks` 表 `content` 字段中被转义 https://github.com/siyuan-note/siyuan/issues/6326
-				tokens = html.UnescapeHTML(tokens)
+			linkDestStr := linkDest.TokensStr()
+			if !cache.ExistAsset(linkDestStr) {
+				return ast.WalkContinue
 			}
-			buf.Write(tokens)
-		case ast.NodeTextMark:
-			if n.IsTextMarkType("tag") {
-				buf.WriteByte('#')
+
+			if !util.ExistsAssetText(linkDestStr) {
+				ret = false
+				return ast.WalkStop
 			}
-			buf.WriteString(n.Content())
-			if n.IsTextMarkType("tag") {
-				buf.WriteByte('#')
-			}
-		case ast.NodeBackslash:
-			buf.WriteByte(lex.ItemBackslash)
-		case ast.NodeBackslashContent:
-			buf.Write(n.Tokens)
 		}
-		lastSpace = false
 		return ast.WalkContinue
 	})
-	return strings.TrimSpace(buf.String())
+	return
+}
+
+func GetNodeSrcTokens(n *ast.Node) (ret string) {
+	if index := bytes.Index(n.Tokens, []byte("src=\"")); 0 < index {
+		src := n.Tokens[index+len("src=\""):]
+		if index = bytes.Index(src, []byte("\"")); 0 < index {
+			src = src[:bytes.Index(src, []byte("\""))]
+			ret = strings.TrimSpace(string(src))
+			return
+		}
+
+		logging.LogWarnf("src is missing the closing double quote in tree [%s] ", n.Box+n.Path)
+	}
+	return
 }
 
 func FirstLeafBlock(node *ast.Node) (ret *ast.Node) {
@@ -199,20 +217,63 @@ func CountBlockNodes(node *ast.Node) (ret int) {
 	return
 }
 
-func ParentNodes(node *ast.Node) (parents []*ast.Node) {
-	const maxDepth = 256
+// ParentNodesWithHeadings 返回所有父级节点。
+// 注意:返回的父级节点包括了标题节点，并且不保证父级层次顺序。
+func ParentNodesWithHeadings(node *ast.Node) (parents []*ast.Node) {
+	const maxDepth = 255
 	i := 0
-	for n := node.Parent; nil != n; n = n.Parent {
-		i++
-		parents = append(parents, n)
-		if ast.NodeDocument == n.Type {
-			return
-		}
+	for n := node; nil != n; n = n.Parent {
+		parent := n.Parent
 		if maxDepth < i {
 			logging.LogWarnf("parent nodes of node [%s] is too deep", node.ID)
 			return
 		}
+		i++
+
+		if nil == parent {
+			return
+		}
+
+		// 标题下方块编辑后刷新标题块更新时间
+		// The heading block update time is refreshed after editing the blocks under the heading https://github.com/siyuan-note/siyuan/issues/11374
+		parentHeadingLevel := 7
+		if ast.NodeHeading == n.Type {
+			parentHeadingLevel = n.HeadingLevel
+		}
+		for prev := n.Previous; nil != prev; prev = prev.Previous {
+			if ast.NodeHeading == prev.Type {
+				if prev.HeadingLevel >= parentHeadingLevel {
+					break
+				}
+
+				parents = append(parents, prev)
+				parentHeadingLevel = prev.HeadingLevel
+			}
+		}
+
+		parents = append(parents, parent)
+		if ast.NodeDocument == parent.Type {
+			return
+		}
 	}
+	return
+}
+
+func ChildBlockNodes(node *ast.Node) (children []*ast.Node) {
+	children = []*ast.Node{}
+	if !node.IsContainerBlock() || ast.NodeDocument == node.Type {
+		children = append(children, node)
+		return
+	}
+
+	ast.Walk(node, func(n *ast.Node, entering bool) ast.WalkStatus {
+		if !entering || !n.IsBlock() {
+			return ast.WalkContinue
+		}
+
+		children = append(children, n)
+		return ast.WalkContinue
+	})
 	return
 }
 
@@ -223,6 +284,39 @@ func ParentBlock(node *ast.Node) *ast.Node {
 		}
 	}
 	return nil
+}
+
+func PreviousBlock(node *ast.Node) *ast.Node {
+	for n := node.Previous; nil != n; n = n.Previous {
+		if "" != n.ID && n.IsBlock() {
+			return n
+		}
+	}
+	return nil
+}
+
+func NextBlock(node *ast.Node) *ast.Node {
+	for n := node.Next; nil != n; n = n.Next {
+		if "" != n.ID && n.IsBlock() {
+			return n
+		}
+	}
+	return nil
+}
+
+func FirstChildBlock(node *ast.Node) (ret *ast.Node) {
+	ast.Walk(node, func(n *ast.Node, entering bool) ast.WalkStatus {
+		if !entering {
+			return ast.WalkContinue
+		}
+
+		if n.IsBlock() {
+			ret = n
+			return ast.WalkStop
+		}
+		return ast.WalkContinue
+	})
+	return
 }
 
 func GetNodeInTree(tree *parse.Tree, id string) (ret *ast.Node) {
@@ -280,6 +374,7 @@ var typeAbbrMap = map[string]string{
 	"NodeParagraph":        "p",
 	"NodeHTMLBlock":        "html",
 	"NodeBlockQueryEmbed":  "query_embed",
+	"NodeAttributeView":    "av",
 	"NodeKramdownBlockIAL": "ial",
 	"NodeIFrame":           "iframe",
 	"NodeWidget":           "widget",
@@ -287,23 +382,11 @@ var typeAbbrMap = map[string]string{
 	"NodeVideo":            "video",
 	"NodeAudio":            "audio",
 	// 行级元素
-	"NodeText":          "text",
-	"NodeImage":         "img",
-	"NodeLinkText":      "link_text",
-	"NodeLinkDest":      "link_dest",
-	"NodeTag":           "tag",
-	"NodeCodeSpan":      "code_span",
-	"NodeInlineMath":    "inline_math",
-	"NodeBlockRefID":    "ref_id",
-	"NodeEmphasis":      "em",
-	"NodeStrong":        "strong",
-	"NodeStrikethrough": "strikethrough",
-	"NodeMark":          "mark",
-	"NodeSup":           "sup",
-	"NodeSub":           "sub",
-	"NodeKbd":           "kbd",
-	"NodeUnderline":     "underline",
-	"NodeTextMark":      "textmark",
+	"NodeText":     "text",
+	"NodeImage":    "img",
+	"NodeLinkText": "link_text",
+	"NodeLinkDest": "link_dest",
+	"NodeTextMark": "textmark",
 }
 
 var abbrTypeMap = map[string]string{}
@@ -357,20 +440,6 @@ func SubTypeAbbr(n *ast.Node) string {
 	return ""
 }
 
-func GetLegacyDynamicBlockRefDefIDs(node *ast.Node) (ret []string) {
-	ast.Walk(node, func(n *ast.Node, entering bool) ast.WalkStatus {
-		if !entering {
-			return ast.WalkContinue
-		}
-		if ast.NodeBlockRefID == n.Type && ast.NodeCloseParen == n.Next.Type {
-			ret = append(ret, n.TokensStr())
-			return ast.WalkSkipChildren
-		}
-		return ast.WalkContinue
-	})
-	return
-}
-
 var DynamicRefTexts = sync.Map{}
 
 func SetDynamicBlockRefText(blockRef *ast.Node, refText string) {
@@ -378,23 +447,9 @@ func SetDynamicBlockRefText(blockRef *ast.Node, refText string) {
 		return
 	}
 
-	if ast.NodeBlockRef == blockRef.Type {
-		idNode := blockRef.ChildByType(ast.NodeBlockRefID)
-		if nil == idNode {
-			return
-		}
-
-		var spacesRefTexts []*ast.Node // 可能会有多个空格，或者遗留错误插入的锚文本节点，这里做一次订正
-		for n := idNode.Next; ast.NodeCloseParen != n.Type; n = n.Next {
-			spacesRefTexts = append(spacesRefTexts, n)
-		}
-		for _, toRemove := range spacesRefTexts {
-			toRemove.Unlink()
-		}
-		refText = strings.TrimSpace(refText)
-		idNode.InsertAfter(&ast.Node{Type: ast.NodeBlockRefDynamicText, Tokens: []byte(refText)})
-		idNode.InsertAfter(&ast.Node{Type: ast.NodeBlockRefSpace})
-		return
+	refText = strings.TrimSpace(refText)
+	if "" == refText {
+		refText = blockRef.TextMarkBlockRefID
 	}
 
 	blockRef.TextMarkBlockRefSubtype = "d"
@@ -404,24 +459,12 @@ func SetDynamicBlockRefText(blockRef *ast.Node, refText string) {
 	DynamicRefTexts.Store(blockRef.TextMarkBlockRefID, refText)
 }
 
-func GetDynamicBlockRefText(blockRef *ast.Node) string {
-	refText := blockRef.ChildByType(ast.NodeBlockRefText)
-	if nil != refText {
-		return refText.Text()
-	}
-	refText = blockRef.ChildByType(ast.NodeBlockRefDynamicText)
-	if nil != refText {
-		return refText.Text()
-	}
-	return "ref resolve failed"
-}
-
 func IsChartCodeBlockCode(code *ast.Node) bool {
 	if nil == code.Previous || ast.NodeCodeBlockFenceInfoMarker != code.Previous.Type || 1 > len(code.Previous.CodeBlockInfo) {
 		return false
 	}
 
-	language := util.BytesToStr(code.Previous.CodeBlockInfo)
+	language := gulu.Str.FromBytes(code.Previous.CodeBlockInfo)
 	language = strings.ReplaceAll(language, editor.Caret, "")
 	return render.NoHighlight(language)
 }

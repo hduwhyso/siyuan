@@ -1,4 +1,4 @@
-// SiYuan - Build Your Eternal Digital Garden
+// SiYuan - Refactor your thinking
 // Copyright (c) 2020-present, b3log.org
 //
 // This program is free software: you can redistribute it and/or modify
@@ -41,7 +41,7 @@ func removeShorthands(c *gin.Context) {
 	}
 
 	err := model.RemoveCloudShorthands(ids)
-	if nil != err {
+	if err != nil {
 		ret.Code = 1
 		ret.Msg = err.Error()
 		return
@@ -59,7 +59,7 @@ func getShorthand(c *gin.Context) {
 
 	id := arg["id"].(string)
 	data, err := model.GetCloudShorthand(id)
-	if nil != err {
+	if err != nil {
 		ret.Code = 1
 		ret.Msg = err.Error()
 		return
@@ -78,7 +78,7 @@ func getShorthands(c *gin.Context) {
 
 	page := int(arg["page"].(float64))
 	data, err := model.GetCloudShorthands(page)
-	if nil != err {
+	if err != nil {
 		ret.Code = 1
 		ret.Msg = err.Error()
 		return

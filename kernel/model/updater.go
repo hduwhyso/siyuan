@@ -1,4 +1,4 @@
-// SiYuan - Build Your Eternal Digital Garden
+// SiYuan - Refactor your thinking
 // Copyright (c) 2020-present, b3log.org
 //
 // This program is free software: you can redistribute it and/or modify
@@ -45,35 +45,37 @@ func execNewVerInstallPkg(newVerInstallPkgPath string) {
 	} else if gulu.OS.IsDarwin() {
 		exec.Command("chmod", "+x", newVerInstallPkgPath).CombinedOutput()
 		cmd = exec.Command("open", newVerInstallPkgPath)
-	} else if gulu.OS.IsLinux() {
-		exec.Command("chmod", "+x", newVerInstallPkgPath).CombinedOutput()
-		cmd = exec.Command("sh", "-c", newVerInstallPkgPath)
 	}
 	gulu.CmdAttr(cmd)
-	cmdErr := cmd.Start()
+	cmdErr := cmd.Run()
 	if nil != cmdErr {
 		logging.LogErrorf("exec install new version failed: %s", cmdErr)
 		return
 	}
 }
 
+var newVerInstallPkgPath string
+
 func getNewVerInstallPkgPath() string {
 	if skipNewVerInstallPkg() {
+		newVerInstallPkgPath = ""
 		return ""
 	}
 
 	downloadPkgURLs, checksum, err := getUpdatePkg()
-	if nil != err || 1 > len(downloadPkgURLs) || "" == checksum {
+	if err != nil || 1 > len(downloadPkgURLs) || "" == checksum {
+		newVerInstallPkgPath = ""
 		return ""
 	}
 
 	pkg := path.Base(downloadPkgURLs[0])
-	ret := filepath.Join(util.TempDir, "install", pkg)
-	localChecksum, _ := sha256Hash(ret)
+	newVerInstallPkgPath = filepath.Join(util.TempDir, "install", pkg)
+	localChecksum, _ := sha256Hash(newVerInstallPkgPath)
 	if checksum != localChecksum {
+		newVerInstallPkgPath = ""
 		return ""
 	}
-	return ret
+	return newVerInstallPkgPath
 }
 
 var checkDownloadInstallPkgLock = sync.Mutex{}
@@ -85,15 +87,13 @@ func checkDownloadInstallPkg() {
 		return
 	}
 
-	if util.IsMutexLocked(&checkDownloadInstallPkgLock) {
+	if !checkDownloadInstallPkgLock.TryLock() {
 		return
 	}
-
-	checkDownloadInstallPkgLock.Lock()
 	defer checkDownloadInstallPkgLock.Unlock()
 
 	downloadPkgURLs, checksum, err := getUpdatePkg()
-	if nil != err || 1 > len(downloadPkgURLs) || "" == checksum {
+	if err != nil || 1 > len(downloadPkgURLs) || "" == checksum {
 		return
 	}
 
@@ -101,7 +101,7 @@ func checkDownloadInstallPkg() {
 	succ := false
 	for _, downloadPkgURL := range downloadPkgURLs {
 		err = downloadInstallPkg(downloadPkgURL, checksum)
-		if nil == err {
+		if err == nil {
 			succ = true
 			break
 
@@ -115,7 +115,7 @@ func checkDownloadInstallPkg() {
 func getUpdatePkg() (downloadPkgURLs []string, checksum string, err error) {
 	defer logging.Recover()
 	result, err := util.GetRhyResult(false)
-	if nil != err {
+	if err != nil {
 		return
 	}
 
@@ -126,24 +126,34 @@ func getUpdatePkg() (downloadPkgURLs []string, checksum string, err error) {
 
 	var suffix string
 	if gulu.OS.IsWindows() {
-		suffix = "win.exe"
+		if "arm64" == runtime.GOARCH {
+			suffix = "win-arm64.exe"
+		} else {
+			suffix = "win.exe"
+		}
 	} else if gulu.OS.IsDarwin() {
 		if "arm64" == runtime.GOARCH {
 			suffix = "mac-arm64.dmg"
 		} else {
 			suffix = "mac.dmg"
 		}
-	} else if gulu.OS.IsLinux() {
-		suffix = "linux.AppImage"
 	}
 	pkg := "siyuan-" + ver + "-" + suffix
 
-	url := "https://github.com/siyuan-note/siyuan/releases/download/v" + ver + "/" + pkg
-	downloadPkgURLs = append(downloadPkgURLs, url)
-	url = "https://ghproxy.com/" + url
-	downloadPkgURLs = append(downloadPkgURLs, url)
-	url = "https://release.b3log.org/siyuan/" + pkg
-	downloadPkgURLs = append(downloadPkgURLs, url)
+	b3logURL := "https://release.b3log.org/siyuan/" + pkg
+	liuyunURL := "https://release.liuyun.io/siyuan/" + pkg
+	githubURL := "https://github.com/siyuan-note/siyuan/releases/download/v" + ver + "/" + pkg
+	ghproxyURL := "https://mirror.ghproxy.com/" + githubURL
+	if util.IsChinaCloud() {
+		downloadPkgURLs = append(downloadPkgURLs, b3logURL)
+		downloadPkgURLs = append(downloadPkgURLs, liuyunURL)
+		downloadPkgURLs = append(downloadPkgURLs, ghproxyURL)
+		downloadPkgURLs = append(downloadPkgURLs, githubURL)
+	} else {
+		downloadPkgURLs = append(downloadPkgURLs, githubURL)
+		downloadPkgURLs = append(downloadPkgURLs, b3logURL)
+		downloadPkgURLs = append(downloadPkgURLs, liuyunURL)
+	}
 
 	checksums := result["checksums"].(map[string]interface{})
 	checksum = checksums[pkg].(string)
@@ -165,18 +175,20 @@ func downloadInstallPkg(pkgURL, checksum string) (err error) {
 	}
 
 	err = os.MkdirAll(filepath.Join(util.TempDir, "install"), 0755)
-	if nil != err {
+	if err != nil {
 		logging.LogErrorf("create temp install dir failed: %s", err)
 		return
 	}
 
 	logging.LogInfof("downloading install package [%s]", pkgURL)
-	client := req.C().SetTLSHandshakeTimeout(7 * time.Second).SetTimeout(10 * time.Minute)
+	client := req.C().SetTLSHandshakeTimeout(7 * time.Second).SetTimeout(10 * time.Minute).DisableInsecureSkipVerify()
 	callback := func(info req.DownloadInfo) {
-		//logging.LogDebugf("downloading install package [%s %.2f%%]", pkgURL, float64(info.DownloadedSize)/float64(info.Response.ContentLength)*100.0)
+		progress := fmt.Sprintf("%.2f%%", float64(info.DownloadedSize)/float64(info.Response.ContentLength)*100.0)
+		// logging.LogDebugf("downloading install package [%s %s]", pkgURL, progress)
+		util.PushStatusBar(fmt.Sprintf(Conf.Language(133), progress))
 	}
-	_, err = client.R().SetOutputFile(savePath).SetDownloadCallback(callback).Get(pkgURL)
-	if nil != err {
+	_, err = client.R().SetOutputFile(savePath).SetDownloadCallbackWithInterval(callback, 1*time.Second).Get(pkgURL)
+	if err != nil {
 		logging.LogErrorf("download install package [%s] failed: %s", pkgURL, err)
 		return
 	}
@@ -187,12 +199,13 @@ func downloadInstallPkg(pkgURL, checksum string) (err error) {
 		return
 	}
 	logging.LogInfof("downloaded install package [%s] to [%s]", pkgURL, savePath)
+	util.PushStatusBar(Conf.Language(62))
 	return
 }
 
 func sha256Hash(filename string) (ret string, err error) {
 	file, err := os.Open(filename)
-	if nil != err {
+	if err != nil {
 		return
 	}
 	defer file.Close()
@@ -213,14 +226,15 @@ func sha256Hash(filename string) (ret string, err error) {
 }
 
 type Announcement struct {
-	Id    string `json:"id"`
-	Title string `json:"title"`
-	URL   string `json:"url"`
+	Id     string `json:"id"`
+	Title  string `json:"title"`
+	URL    string `json:"url"`
+	Region int    `json:"region"`
 }
 
 func GetAnnouncements() (ret []*Announcement) {
 	result, err := util.GetRhyResult(false)
-	if nil != err {
+	if err != nil {
 		logging.LogErrorf("get announcement failed: %s", err)
 		return
 	}
@@ -233,9 +247,10 @@ func GetAnnouncements() (ret []*Announcement) {
 	for _, announcement := range announcements {
 		ann := announcement.(map[string]interface{})
 		ret = append(ret, &Announcement{
-			Id:    ann["id"].(string),
-			Title: ann["title"].(string),
-			URL:   ann["url"].(string),
+			Id:     ann["id"].(string),
+			Title:  ann["title"].(string),
+			URL:    ann["url"].(string),
+			Region: int(ann["region"].(float64)),
 		})
 	}
 	return
@@ -246,20 +261,28 @@ func CheckUpdate(showMsg bool) {
 		return
 	}
 
+	if Conf.System.IsMicrosoftStore {
+		return
+	}
+
 	result, err := util.GetRhyResult(showMsg)
-	if nil != err {
+	if err != nil {
 		return
 	}
 
 	ver := result["ver"].(string)
-	release := result["release"].(string)
+	releaseLang := result["release"].(string)
+	if releaseLangArg := result["release_"+Conf.Lang]; nil != releaseLangArg {
+		releaseLang = releaseLangArg.(string)
+	}
+
 	var msg string
 	var timeout int
 	if isVersionUpToDate(ver) {
 		msg = Conf.Language(10)
 		timeout = 3000
 	} else {
-		msg = fmt.Sprintf(Conf.Language(9), "<a href=\""+release+"\">"+release+"</a>")
+		msg = fmt.Sprintf(Conf.Language(9), "<a href=\""+releaseLang+"\">"+releaseLang+"</a>")
 		showMsg = true
 		timeout = 15000
 	}
@@ -269,7 +292,7 @@ func CheckUpdate(showMsg bool) {
 			defer logging.Recover()
 			checkDownloadInstallPkg()
 			if "" != getNewVerInstallPkgPath() {
-				util.PushMsg(Conf.Language(62), 0)
+				util.PushMsg(Conf.Language(62), 15*1000)
 			}
 		}()
 	}
@@ -280,14 +303,21 @@ func isVersionUpToDate(releaseVer string) bool {
 }
 
 func skipNewVerInstallPkg() bool {
-	if !gulu.OS.IsWindows() && !gulu.OS.IsDarwin() && !gulu.OS.IsLinux() {
+	if !gulu.OS.IsWindows() && !gulu.OS.IsDarwin() {
 		return true
 	}
-	if util.ISMicrosoftStore {
+	if util.ISMicrosoftStore || util.ContainerStd != util.Container {
 		return true
 	}
 	if !Conf.System.DownloadInstallPkg {
 		return true
+	}
+	if gulu.OS.IsWindows() {
+		plat := strings.ToLower(Conf.System.OSPlatform)
+		// Windows 7, 8 and Server 2012 are no longer supported https://github.com/siyuan-note/siyuan/issues/7347
+		if strings.Contains(plat, " 7 ") || strings.Contains(plat, " 8 ") || strings.Contains(plat, "2012") {
+			return true
+		}
 	}
 	return false
 }

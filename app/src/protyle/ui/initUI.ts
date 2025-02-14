@@ -1,24 +1,35 @@
 import {setEditMode} from "../util/setEditMode";
-import {lineNumberRender} from "../markdown/highlightRender";
 import {scrollEvent} from "../scroll/event";
 import {isMobile} from "../../util/functions";
 import {Constants} from "../../constants";
-import {hasClosestByAttribute, hasClosestByClassName} from "../util/hasClosest";
+import {isMac} from "../util/compatibility";
+import {setInlineStyle} from "../../util/assets";
+import {fetchPost} from "../../util/fetch";
+import {lineNumberRender} from "../render/highlightRender";
+import {hideMessage, showMessage} from "../../dialog/message";
+import {genUUID} from "../../util/genID";
+import {getContenteditableElement, getLastBlock} from "../wysiwyg/getBlock";
+import {genEmptyElement} from "../../block/util";
+import {transaction} from "../wysiwyg/transaction";
+import {focusByRange} from "../util/selection";
+/// #if !MOBILE
+import {moveResize} from "../../dialog/moveResize";
+/// #endif
 
 export const initUI = (protyle: IProtyle) => {
     protyle.contentElement = document.createElement("div");
     protyle.contentElement.className = "protyle-content";
-    if (window.siyuan.config.editor.fullWidth) {
-        protyle.contentElement.setAttribute("data-fullwidth", "true");
-    } else {
-        protyle.contentElement.removeAttribute("data-fullwidth");
+
+    if (protyle.options.render.background || protyle.options.render.title) {
+        protyle.contentElement.innerHTML = '<div class="protyle-top"></div>';
+        if (protyle.options.render.background) {
+            protyle.contentElement.firstElementChild.appendChild(protyle.background.element);
+        }
+        if (protyle.options.render.title) {
+            protyle.contentElement.firstElementChild.appendChild(protyle.title.element);
+        }
     }
-    if (protyle.options.render.background) {
-        protyle.contentElement.appendChild(protyle.background.element);
-    }
-    if (protyle.options.render.title) {
-        protyle.contentElement.appendChild(protyle.title.element);
-    }
+
     protyle.contentElement.appendChild(protyle.wysiwyg.element);
     if (!protyle.options.action.includes(Constants.CB_GET_HISTORY)) {
         scrollEvent(protyle, protyle.contentElement);
@@ -43,99 +54,206 @@ export const initUI = (protyle: IProtyle) => {
 
     protyle.element.appendChild(protyle.toolbar.element);
     protyle.element.appendChild(protyle.toolbar.subElement);
+    /// #if !MOBILE
+    moveResize(protyle.toolbar.subElement, () => {
+        const pinElement = protyle.toolbar.subElement.querySelector('.block__icons [data-type="pin"]');
+        if (pinElement) {
+            pinElement.querySelector("svg use").setAttribute("xlink:href", "#iconUnpin");
+            pinElement.setAttribute("aria-label", window.siyuan.languages.unpin);
+            protyle.toolbar.subElement.firstElementChild.setAttribute("data-drag", "true");
+        }
+    });
+    /// #endif
+
+    protyle.element.append(protyle.highlight.styleElement);
 
     addLoading(protyle);
 
     setEditMode(protyle, protyle.options.mode);
     document.execCommand("DefaultParagraphSeparator", false, "p");
 
-    // 触摸屏背景和嵌入块按钮显示
-    protyle.contentElement.addEventListener("touchstart", (event) => {
-        // https://github.com/siyuan-note/siyuan/issues/6328
-        if (protyle.disabled) {
+    let wheelTimeout: number;
+    const wheelId = genUUID();
+    const isMacOS = isMac();
+    protyle.contentElement.addEventListener("mousewheel", (event: WheelEvent) => {
+        if (!window.siyuan.config.editor.fontSizeScrollZoom || (isMacOS && !event.metaKey) || (!isMacOS && !event.ctrlKey) || event.deltaX !== 0) {
             return;
         }
-        const target = event.target as HTMLElement;
-        if (hasClosestByClassName(target, "protyle-icons") ||
-            hasClosestByClassName(target, "item") ||
-            target.classList.contains("protyle-background__icon")) {
+        event.stopPropagation();
+        if (event.deltaY < 0) {
+            if (window.siyuan.config.editor.fontSize < 72) {
+                window.siyuan.config.editor.fontSize++;
+            } else {
+                return;
+            }
+        } else if (event.deltaY > 0) {
+            if (window.siyuan.config.editor.fontSize > 9) {
+                window.siyuan.config.editor.fontSize--;
+            } else {
+                return;
+            }
+        }
+        setInlineStyle();
+        clearTimeout(wheelTimeout);
+        showMessage(`${window.siyuan.languages.fontSize} ${window.siyuan.config.editor.fontSize}px<span class="fn__space"></span>
+<button class="b3-button b3-button--white">${window.siyuan.languages.reset} 16px</button>`, undefined, undefined, wheelId);
+        wheelTimeout = window.setTimeout(() => {
+            fetchPost("/api/setting/setEditor", window.siyuan.config.editor);
+            protyle.wysiwyg.element.querySelectorAll(".code-block .protyle-linenumber__rows").forEach((block: HTMLElement) => {
+                lineNumberRender(block.parentElement);
+            });
+            document.querySelector(`#message [data-id="${wheelId}"] button`)?.addEventListener("click", () => {
+                window.siyuan.config.editor.fontSize = 16;
+                setInlineStyle();
+                fetchPost("/api/setting/setEditor", window.siyuan.config.editor);
+                hideMessage(wheelId);
+                protyle.wysiwyg.element.querySelectorAll(".code-block .protyle-linenumber__rows").forEach((block: HTMLElement) => {
+                    lineNumberRender(block.parentElement);
+                });
+            });
+        }, Constants.TIMEOUT_LOAD);
+    }, {passive: true});
+    protyle.contentElement.addEventListener("click", (event: MouseEvent & { target: HTMLElement }) => {
+        // wysiwyg 元素下方点击无效果 https://github.com/siyuan-note/siyuan/issues/12009
+        if (protyle.disabled ||
+            // 选中块时，禁止添加空块 https://github.com/siyuan-note/siyuan/issues/13905
+            protyle.contentElement.querySelector(".protyle-wysiwyg--select") ||
+            (!event.target.classList.contains("protyle-content") && !event.target.classList.contains("protyle-wysiwyg"))) {
             return;
         }
-        if (hasClosestByClassName(target, "protyle-background")) {
-            protyle.background.element.classList.toggle("protyle-background--mobileshow");
-            return;
+        // 选中文本禁止添加空块 https://github.com/siyuan-note/siyuan/issues/13905
+        if (window.getSelection().rangeCount > 0) {
+            const currentRange = window.getSelection().getRangeAt(0);
+            if (currentRange.toString() !== "" && protyle.wysiwyg.element.contains(currentRange.startContainer)) {
+                return;
+            }
         }
-        const embedBlockElement = hasClosestByAttribute(target, "data-type", "NodeBlockQueryEmbed");
-        if (embedBlockElement) {
-            embedBlockElement.firstElementChild.classList.toggle("protyle-icons--show");
+        const lastRect = protyle.wysiwyg.element.lastElementChild.getBoundingClientRect();
+        const range = document.createRange();
+        if (event.y > lastRect.bottom) {
+            const lastEditElement = getContenteditableElement(getLastBlock(protyle.wysiwyg.element.lastElementChild));
+            if (!lastEditElement ||
+                (protyle.wysiwyg.element.lastElementChild.getAttribute("data-type") !== "NodeParagraph" && protyle.wysiwyg.element.getAttribute("data-doc-type") !== "NodeListItem" && !protyle.options.backlinkData) ||
+                (protyle.wysiwyg.element.lastElementChild.getAttribute("data-type") === "NodeParagraph" && getContenteditableElement(lastEditElement).innerHTML !== "")) {
+                const emptyElement = genEmptyElement(false, false);
+                protyle.wysiwyg.element.insertAdjacentElement("beforeend", emptyElement);
+                transaction(protyle, [{
+                    action: "insert",
+                    data: emptyElement.outerHTML,
+                    id: emptyElement.getAttribute("data-node-id"),
+                    previousID: emptyElement.previousElementSibling.getAttribute("data-node-id"),
+                    parentID: protyle.block.parentID
+                }], [{
+                    action: "delete",
+                    id: emptyElement.getAttribute("data-node-id")
+                }]);
+                const emptyEditElement = getContenteditableElement(emptyElement) as HTMLInputElement;
+                range.selectNodeContents(emptyEditElement);
+                range.collapse(true);
+                focusByRange(range);
+                // 需等待 range 更新再次进行渲染
+                if (protyle.options.render.breadcrumb) {
+                    setTimeout(() => {
+                        protyle.breadcrumb.render(protyle);
+                    }, Constants.TIMEOUT_TRANSITION);
+                }
+            } else if (lastEditElement) {
+                range.selectNodeContents(lastEditElement);
+                range.collapse(false);
+                focusByRange(range);
+            }
         }
     });
 };
 
-export const addLoading = (protyle: IProtyle) => {
-    protyle.element.insertAdjacentHTML("beforeend", '<div style="background-color: var(--b3-theme-background)" class="fn__loading wysiwygLoading"><img width="48px" src="/stage/loading-pure.svg"></div>');
+export const addLoading = (protyle: IProtyle, msg?: string) => {
+    protyle.element.removeAttribute("data-loading");
+    setTimeout(() => {
+        if (protyle.element.getAttribute("data-loading") !== "finished") {
+            protyle.element.insertAdjacentHTML("beforeend", `<div style="background-color: var(--b3-theme-background);flex-direction: column;" class="fn__loading wysiwygLoading">
+    <img width="48px" src="/stage/loading-pure.svg">
+    <div style="color: var(--b3-theme-on-surface);margin-top: 8px;">${msg || ""}</div>
+</div>`);
+        }
+    }, Constants.TIMEOUT_LOAD);
 };
 
 export const removeLoading = (protyle: IProtyle) => {
-    const loadingElement = protyle.element.querySelector(".wysiwygLoading");
-    if (loadingElement) {
-        loadingElement.remove();
-    }
+    protyle.element.setAttribute("data-loading", "finished");
+    protyle.element.querySelectorAll(".wysiwygLoading").forEach(item => {
+        item.remove();
+    });
 };
 
 export const setPadding = (protyle: IProtyle) => {
     if (protyle.options.action.includes(Constants.CB_GET_HISTORY)) {
-        return;
+        return {
+            width: 0,
+            padding: 0
+        };
     }
-    let min16 = 16;
-    let min24 = 24;
-    if (!isMobile()) {
-        let padding = (protyle.element.clientWidth - Constants.SIZE_EDITOR_WIDTH) / 2;
-        if (!window.siyuan.config.editor.fullWidth && padding > 96) {
-            if (padding > Constants.SIZE_EDITOR_WIDTH) {
-                // 超宽屏调整 https://ld246.com/article/1668266637363
-                padding = protyle.element.clientWidth / 3;
-            }
-            min16 = padding;
-            min24 = padding;
-        } else if (protyle.element.clientWidth > Constants.SIZE_EDITOR_WIDTH) {
-            min16 = 96;
-            min24 = 96;
-        }
-    }
-    if (protyle.options.render.background && protyle.options.render.title) {
-        protyle.background.element.lastElementChild.setAttribute("style", `left:${min16}px`);
-        protyle.title.element.style.margin = `16px ${min16}px 0 ${min24}px`;
-    } else if (protyle.options.render.background && !protyle.options.render.title) {
-        protyle.background.element.lastElementChild.setAttribute("style", `left:${min16}px`);
-    } else if (!protyle.options.render.background && protyle.options.render.title) {
-        protyle.title.element.style.margin = `16px ${min16}px 0 ${min24}px`;
-    }
-    let bottomHeight = "16px";
-    if (protyle.options.typewriterMode) {
-        if (isMobile()) {
-            bottomHeight = window.innerHeight / 5 + "px";
-        } else {
-            bottomHeight = protyle.element.clientHeight / 2 + "px";
-        }
-    }
+    const oldLeft = parseInt(protyle.wysiwyg.element.style.paddingLeft);
+    const padding = getPadding(protyle);
+    const left = padding.left;
+    const right = padding.right;
     if (protyle.options.backlinkData) {
-        protyle.wysiwyg.element.style.padding = `4px ${min16}px 4px ${min24}px`;
+        protyle.wysiwyg.element.style.padding = `4px ${right}px 4px ${left}px`;
     } else {
-        protyle.wysiwyg.element.style.padding = `16px ${min16}px ${bottomHeight} ${min24}px`;
+        protyle.wysiwyg.element.style.padding = `${padding.top}px ${right}px ${padding.bottom}px ${left}px`;
     }
-    protyle.wysiwyg.element.style.transition = ""; // addWnd 时防止向右分屏，左侧文档抖动，移除动画
-    if (window.siyuan.config.editor.codeSyntaxHighlightLineNum) {
-        setTimeout(() => { // https://github.com/siyuan-note/siyuan/issues/5612
-            protyle.wysiwyg.element.querySelectorAll('.code-block [contenteditable="true"]').forEach((block: HTMLElement) => {
-                lineNumberRender(block);
-            });
-        }, 300);
+    if (protyle.options.render.background) {
+        protyle.background.element.querySelector(".protyle-background__ia").setAttribute("style", `margin-left:${left}px;margin-right:${right}px`);
+    }
+    if (protyle.options.render.title) {
+        // pc 端 文档名 attr 过长和添加标签等按钮重合
+        protyle.title.element.style.margin = `16px ${right}px 0 ${left}px`;
     }
     if (window.siyuan.config.editor.displayBookmarkIcon) {
         const editorAttrElement = document.getElementById("editorAttr");
         if (editorAttrElement) {
-            editorAttrElement.innerHTML = `.protyle-wysiwyg--attr .b3-tooltips:after { max-width: ${protyle.wysiwyg.element.clientWidth - min16 - min24}px; }`;
+            editorAttrElement.innerHTML = `.protyle-wysiwyg--attr .b3-tooltips::after { max-width: ${protyle.wysiwyg.element.clientWidth - left - right}px; }`;
         }
     }
+    const oldWidth = protyle.wysiwyg.element.getAttribute("data-realwidth");
+    const newWidth = protyle.wysiwyg.element.clientWidth - parseInt(protyle.wysiwyg.element.style.paddingLeft) - parseInt(protyle.wysiwyg.element.style.paddingRight);
+    protyle.wysiwyg.element.setAttribute("data-realwidth", newWidth.toString());
+    return {
+        width: Math.abs(parseInt(oldWidth) - newWidth),
+        padding: Math.abs(oldLeft - parseInt(protyle.wysiwyg.element.style.paddingLeft))
+    };
+};
+
+export const getPadding = (protyle: IProtyle) => {
+    let right = 16;
+    let left = 24;
+    let bottom = 16;
+    if (protyle.options.typewriterMode) {
+        if (isMobile()) {
+            bottom = window.innerHeight / 5;
+        } else {
+            bottom = protyle.element.clientHeight / 2;
+        }
+    }
+    if (!isMobile()) {
+        let isFullWidth = protyle.wysiwyg.element.getAttribute(Constants.CUSTOM_SY_FULLWIDTH);
+        if (!isFullWidth) {
+            isFullWidth = window.siyuan.config.editor.fullWidth ? "true" : "false";
+        }
+        let padding = (protyle.element.clientWidth - Constants.SIZE_EDITOR_WIDTH) / 2;
+        if (isFullWidth === "false" && padding > 96) {
+            if (padding > Constants.SIZE_EDITOR_WIDTH) {
+                // 超宽屏调整 https://ld246.com/article/1668266637363
+                padding = protyle.element.clientWidth * .382 / 1.382;
+            }
+            padding = Math.ceil(padding);
+            left = padding;
+            right = padding;
+        } else if (protyle.element.clientWidth > Constants.SIZE_EDITOR_WIDTH) {
+            left = 96;
+            right = 96;
+        }
+    }
+    return {
+        left, right, bottom, top: 16
+    };
 };
